@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, functions
+from telethon.tl.types import InputMediaDice
 
 load_dotenv()
 
@@ -538,6 +539,41 @@ async def mock_handler(event):
     await event.edit(mocked)
 
 
+DICE_MAX_ATTEMPTS = 60  # سقف تلاش - میانگین لازم ۶ باره، این حاشیه‌ی امن کافیه
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat("تاس")))
+async def dice_handler(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg.isdigit() or not (1 <= int(arg) <= 6):
+        return await event.edit(f"مثال: `{PREFIX}تاس 4` (عدد باید بین ۱ تا ۶ باشه)")
+    target = int(arg)
+    await event.delete()
+
+    for _ in range(DICE_MAX_ATTEMPTS):
+        try:
+            msg = await client.send_message(event.chat_id, file=InputMediaDice("🎲"))
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            continue
+        except Exception as e:
+            return await client.send_message(event.chat_id, f"❌ خطا در ارسال تاس: {e}")
+
+        value = getattr(msg.media, "value", None)
+        if value == target:
+            return  # تاس با عدد درست موند، تمام
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+    await client.send_message(
+        event.chat_id, f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم"
+    )
+
+
 # ---------------------------------------------------------------------------
 # ۶) پروفایل: setbio / setname / setpic / clock
 # ---------------------------------------------------------------------------
@@ -922,6 +958,7 @@ def build_help_text():
 {PREFIX}type <متن> — شبیه‌سازی تایپ قبل از ارسال
 {PREFIX}reverse <متن> — معکوس کردن متن
 {PREFIX}mock <متن> — mOcKiNg CaSe
+{PREFIX}تاس <۱ تا ۶> — انداختن تاس واقعی تا رسیدن به همون عدد
 
 **پروفایل**
 {PREFIX}setbio <متن> — تغییر بیو
