@@ -21,7 +21,7 @@ import operator
 import asyncio
 import requests
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, functions
@@ -38,6 +38,9 @@ CLOCK_INTERVAL = max(int(os.getenv("CLOCK_INTERVAL", "60")), 30)  # حداقل �
 NOTES_FILE = os.getenv("NOTES_FILE", "notes.json")  # اگه Volume وصل کردی: مثلاً /data/notes.json
 AUTOPOST_FILE = os.getenv("AUTOPOST_FILE", "autopost.json")  # اگه Volume وصل کردی: مثلاً /data/autopost.json
 AUTOPOST_MIN_INTERVAL_MINUTES = 1  # حداقل فاصله مجاز - برای کاهش ریسک اسپم بهتره کمتر از ۵ نذاری
+ASSISTANT_FILE = os.getenv("ASSISTANT_FILE", "assistant.json")  # اگه Volume وصل کردی: مثلاً /data/assistant.json
+ASSISTANT_ONLINE_THRESHOLD = int(os.getenv("ASSISTANT_ONLINE_THRESHOLD", "90"))  # ثانیه - آستانه‌ی تشخیص آنلاین‌بودن
+ASSISTANT_CHECK_INTERVAL = max(int(os.getenv("ASSISTANT_CHECK_INTERVAL", "30")), 15)  # هر چند ثانیه وضعیت چک بشه
 
 if SESSION_STRING:
     from telethon.sessions import StringSession
@@ -46,7 +49,46 @@ else:
     client = TelegramClient("selfbot_session", API_ID, API_HASH)
 
 START_TIME = time.time()
-afk_state = {"active": False, "reason": "", "replied": set(), "since": None}
+def load_assistant():
+    default = {
+        "mode": "auto",
+        "text": "سلام 👋 در حال حاضر آنلاین نیستم. پیامتون رو دیدم، به‌محض امکان جواب می‌دم.",
+        "delay": 3,
+        "include": [],
+        "exclude": [],
+    }
+    if os.path.exists(ASSISTANT_FILE):
+        with open(ASSISTANT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            default.update({k: data.get(k, v) for k, v in default.items()})
+    return default
+
+
+def save_assistant():
+    d = os.path.dirname(ASSISTANT_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    payload = {
+        "mode": assistant_state["mode"],
+        "text": assistant_state["text"],
+        "delay": assistant_state["delay"],
+        "include": list(assistant_state["include"]),
+        "exclude": list(assistant_state["exclude"]),
+    }
+    with open(ASSISTANT_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+_assistant_loaded = load_assistant()
+assistant_state = {
+    "enabled": False,  # این رو تسک پس‌زمینه‌ی تشخیص آنلاین/آفلاین خودش مدیریت می‌کنه
+    "mode": _assistant_loaded["mode"],
+    "text": _assistant_loaded["text"],
+    "delay": _assistant_loaded["delay"],
+    "include": set(_assistant_loaded["include"]),
+    "exclude": set(_assistant_loaded["exclude"]),
+    "replied": set(),  # (chat_id, sender_id) که توی این نشست جواب گرفتن
+}
 clock_state = {"enabled": True, "base_name": None, "style": "default"}
 
 
@@ -683,41 +725,173 @@ async def clockstyle_handler(event):
 
 
 # ---------------------------------------------------------------------------
-# ۷) AFK: افک خودکار با پاسخ به منشن/پیوی
+# ۷) منشی چت: پاسخ خودکار هوشمند با تشخیص آنلاین/آفلاین
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("afk")))
-async def afk_handler(event):
-    reason = event.pattern_match.group(1) or "بدون دلیل خاص"
-    afk_state["active"] = True
-    afk_state["reason"] = reason
-    afk_state["since"] = datetime.now()
-    afk_state["replied"] = set()
-    await event.edit(f"😴 وضعیت AFK فعال شد\nدلیل: {reason}")
+_ASSISTANT_MODE_FA = {
+    "auto": "خودکار (همه‌جا)",
+    "mention": "فقط با منشن/ریپلای",
+    "pm": "فقط پیوی",
+    "groups": "فقط گروه‌ها",
+}
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("unafk", arg=False)))
-async def unafk_handler(event):
-    afk_state["active"] = False
-    afk_state["replied"] = set()
-    await event.edit("✅ از حالت AFK خارج شدید")
+def _assistant_status_text():
+    status = "روشن ✅" if assistant_state["enabled"] else "خاموش ❌"
+    mode_fa = _ASSISTANT_MODE_FA.get(assistant_state["mode"], assistant_state["mode"])
+    return (
+        "🤖 **منشی چت**\n\n"
+        f"• وضعیت: {status}\n"
+        f"• حالت: {mode_fa}\n"
+        f"• تأخیر پاسخ: {assistant_state['delay']} ثانیه\n"
+        f"• متن: {assistant_state['text'] or '(تنظیم نشده)'}\n"
+        f"• چت‌های مستثنی: {len(assistant_state['exclude'])}\n"
+        f"• چت‌های همیشه‌فعال: {len(assistant_state['include'])}\n\n"
+        f"تشخیص آنلاین/آفلاین خودکاره (هر {ASSISTANT_CHECK_INTERVAL} ثانیه چک می‌شه): "
+        "وقتی خودت (مثلاً از گوشی) فعال باشی خاموش می‌مونه، وقتی واقعاً آفلاین "
+        f"باشی خودش روشن می‌شه. با `{PREFIX}assistant on/off` می‌تونی دستی override "
+        "کنی، ولی توجه کن با اولین فعالیت واقعی‌ات دوباره خودکار اصلاح می‌شه."
+    )
+
+
+def _assistant_should_respond(event):
+    if event.is_channel and not event.is_group:
+        return False  # کانال‌های برادکست رو نادیده بگیر
+    chat_id = event.chat_id
+    if chat_id in assistant_state["exclude"]:
+        return False
+    if chat_id in assistant_state["include"]:
+        return True
+    mode = assistant_state["mode"]
+    if mode == "auto":
+        return True
+    if mode == "pm":
+        return event.is_private
+    if mode == "groups":
+        return event.is_group
+    if mode == "mention":
+        if event.is_private:
+            return True
+        return bool(getattr(event.message, "mentioned", False))
+    return False
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat("assistant")))
+async def assistant_handler(event):
+    raw = (event.pattern_match.group(1) or "").strip()
+    parts = raw.split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if not sub or sub == "status":
+        return await event.edit(_assistant_status_text())
+
+    if sub == "on":
+        assistant_state["enabled"] = True
+        assistant_state["replied"] = set()
+        return await event.edit(_assistant_status_text())
+
+    if sub == "off":
+        assistant_state["enabled"] = False
+        return await event.edit(_assistant_status_text())
+
+    if sub == "text":
+        text = rest
+        if not text and event.is_reply:
+            reply = await event.get_reply_message()
+            text = reply.raw_text or ""
+        if not text:
+            return await event.edit(f"مثال: `{PREFIX}assistant text سلام، فعلاً آنلاین نیستم`")
+        assistant_state["text"] = text
+        save_assistant()
+        return await event.edit("✅ متن پاسخ ذخیره شد")
+
+    if sub == "delay":
+        if not rest.strip().isdigit():
+            return await event.edit(f"مثال: `{PREFIX}assistant delay 3`")
+        assistant_state["delay"] = max(int(rest.strip()), 0)
+        save_assistant()
+        return await event.edit(f"✅ تأخیر روی {assistant_state['delay']} ثانیه تنظیم شد")
+
+    if sub == "mode":
+        m = rest.strip().lower()
+        if m not in _ASSISTANT_MODE_FA:
+            return await event.edit(f"مثال: `{PREFIX}assistant mode auto` (auto/mention/pm/groups)")
+        assistant_state["mode"] = m
+        save_assistant()
+        return await event.edit(f"✅ حالت روی `{m}` تنظیم شد")
+
+    if sub == "exclude":
+        assistant_state["exclude"].add(event.chat_id)
+        assistant_state["include"].discard(event.chat_id)
+        save_assistant()
+        return await event.edit("🚫 این چت مستثنی شد (منشی اینجا پاسخ نمی‌ده)")
+
+    if sub == "include":
+        assistant_state["include"].add(event.chat_id)
+        assistant_state["exclude"].discard(event.chat_id)
+        save_assistant()
+        return await event.edit("✅ این چت به لیست همیشه‌فعال اضافه شد")
+
+    if sub == "clear":
+        assistant_state["include"].clear()
+        assistant_state["exclude"].clear()
+        save_assistant()
+        return await event.edit("🗑 لیست include/exclude پاک شد")
+
+    await event.edit(f"دستور نامعتبره. برای وضعیت کامل: `{PREFIX}assistant`")
 
 
 @client.on(events.NewMessage(incoming=True))
-async def afk_autoreply(event):
-    if not afk_state["active"]:
+async def assistant_autoreply(event):
+    if not assistant_state["enabled"] or not assistant_state["text"]:
         return
+    sender_id = event.sender_id
     me = await client.get_me()
-    is_mention = bool(me.username) and event.raw_text and f"@{me.username}" in event.raw_text
-    if event.is_private or is_mention:
-        sender_id = event.sender_id
-        if sender_id is None or sender_id == me.id or sender_id in afk_state["replied"]:
-            return
-        afk_state["replied"].add(sender_id)
-        since = afk_state["since"].strftime("%H:%M")
-        await event.reply(
-            f"😴 در حال حاضر AFK هستم (از ساعت {since})\nدلیل: {afk_state['reason']}"
-        )
+    if sender_id is None or sender_id == me.id:
+        return
+    if not _assistant_should_respond(event):
+        return
+    key = (event.chat_id, sender_id)
+    if key in assistant_state["replied"]:
+        return  # به هر نفر فقط یک‌بار در هر نشست جواب می‌ده، نه هر پیام
+    assistant_state["replied"].add(key)
+    try:
+        delay = assistant_state["delay"]
+        if delay > 0:
+            async with client.action(event.chat_id, "typing"):
+                await asyncio.sleep(delay)
+        await event.reply(assistant_state["text"])
+    except Exception as e:
+        print("خطا در پاسخ خودکار منشی:", e)
+
+
+async def assistant_status_watcher():
+    """
+    هر چند ثانیه یک‌بار (ASSISTANT_CHECK_INTERVAL) لیست سشن‌های فعال اکانت رو
+    از تلگرام می‌گیره. اگه سشنی غیر از همین اسکریپت (مثلاً گوشی خودت) به‌تازگی
+    فعال بوده باشه، یعنی خودت آنلاینی -> منشی خاموش می‌شه. اگه هیچ سشن دیگه‌ای
+    به‌تازگی فعال نبوده -> یعنی آفلاینی -> منشی خودش روشن می‌شه.
+    """
+    while True:
+        try:
+            result = await client(functions.account.GetAuthorizationsRequest())
+            others = [a for a in result.authorizations if not a.current]
+            if others:
+                last_active = max(a.date_active for a in others)
+                seconds_since = (datetime.now(timezone.utc) - last_active).total_seconds()
+                online_elsewhere = seconds_since < ASSISTANT_ONLINE_THRESHOLD
+            else:
+                online_elsewhere = False  # هیچ سشن دیگه‌ای وصل نیست
+
+            new_enabled = not online_elsewhere
+            if new_enabled != assistant_state["enabled"]:
+                if new_enabled:
+                    assistant_state["replied"] = set()  # نشست تازه = دوباره به همه جواب بده
+                assistant_state["enabled"] = new_enabled
+        except Exception as e:
+            print("خطا در بررسی وضعیت آنلاین/آفلاین:", e)
+        await asyncio.sleep(ASSISTANT_CHECK_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -968,9 +1142,15 @@ def build_help_text():
 {PREFIX}clockstyle — لیست استایل‌های ساعت (فونت/شکل)
 {PREFIX}clockstyle <نام>/next — تغییر استایل ساعت
 
-**AFK**
-{PREFIX}afk <دلیل> — فعال‌سازی AFK
-{PREFIX}unafk — خروج از AFK
+**🤖 منشی چت**
+{PREFIX}assistant on/off — روشن/خاموش کردن منشی
+{PREFIX}assistant status — نمایش وضعیت منشی
+{PREFIX}assistant text <متن> — تنظیم پیام پاسخ
+{PREFIX}assistant delay <ثانیه> — تنظیم تأخیر
+{PREFIX}assistant mode <auto/mention/pm/groups> — تعیین حالت پاسخ
+{PREFIX}assistant exclude — عدم پاسخ در چت فعلی
+{PREFIX}assistant include — فعال‌سازی برای چت فعلی
+{PREFIX}assistant clear — حذف لیست چت‌ها
 
 **مدیریت گروه** (فقط جایی که ادمین هستید)
 {PREFIX}kick / {PREFIX}ban / {PREFIX}promote / {PREFIX}demote — با ریپلای روی کاربر
@@ -1040,6 +1220,7 @@ async def main():
     print(f"✅ سلف‌بات با اکانت {me.first_name} روشن شد")
     client.loop.create_task(clock_updater())
     client.loop.create_task(autopost_worker())
+    client.loop.create_task(assistant_status_watcher())
     await client.run_until_disconnected()
 
 
