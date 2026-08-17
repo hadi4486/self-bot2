@@ -39,7 +39,7 @@ NOTES_FILE = os.getenv("NOTES_FILE", "notes.json")  # اگه Volume وصل کر�
 AUTOPOST_FILE = os.getenv("AUTOPOST_FILE", "autopost.json")  # اگه Volume وصل کردی: مثلاً /data/autopost.json
 AUTOPOST_MIN_INTERVAL_MINUTES = 1  # حداقل فاصله مجاز - برای کاهش ریسک اسپم بهتره کمتر از ۵ نذاری
 ASSISTANT_FILE = os.getenv("ASSISTANT_FILE", "assistant.json")  # اگه Volume وصل کردی: مثلاً /data/assistant.json
-ASSISTANT_ONLINE_THRESHOLD = int(os.getenv("ASSISTANT_ONLINE_THRESHOLD", "90"))  # ثانیه - آستانه‌ی تشخیص آنلاین‌بودن
+ASSISTANT_ONLINE_THRESHOLD = int(os.getenv("ASSISTANT_ONLINE_THRESHOLD", "180"))  # ثانیه - آستانه‌ی تشخیص آنلاین‌بودن
 ASSISTANT_CHECK_INTERVAL = max(int(os.getenv("ASSISTANT_CHECK_INTERVAL", "30")), 15)  # هر چند ثانیه وضعیت چک بشه
 
 if SESSION_STRING:
@@ -49,9 +49,10 @@ else:
     client = TelegramClient("selfbot_session", API_ID, API_HASH)
 
 START_TIME = time.time()
+SELF_ID = None  # توی main() موقع اتصال پر می‌شه - برای جلوگیری از فراخوانی مکرر get_me()
 def load_assistant():
     default = {
-        "mode": "auto",
+        "mode": "mention",
         "text": "سلام 👋 در حال حاضر آنلاین نیستم. پیامتون رو دیدم، به‌محض امکان جواب می‌دم.",
         "delay": 3,
         "include": [],
@@ -584,24 +585,38 @@ async def mock_handler(event):
 DICE_MAX_ATTEMPTS = 60  # سقف تلاش - میانگین لازم ۶ باره، این حاشیه‌ی امن کافیه
 
 
+async def _roll_real_dice(chat_id):
+    """
+    یه تاس واقعی می‌فرسته. برای اطمینان از خوندن درستِ عدد نتیجه، به‌جای اتکا
+    به آبجکتی که مستقیم از send_file برمی‌گرده (که بعضی‌وقت‌ها media توش کامل
+    پر نشده)، پیام رو یک‌بار دیگه از خودِ سرور تلگرام می‌خونیم.
+    """
+    sent = await client.send_file(chat_id, InputMediaDice("🎲"))
+    fresh = await client.get_messages(chat_id, ids=sent.id)
+    value = getattr(getattr(fresh, "media", None), "value", None)
+    return fresh, value
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=pat("تاس")))
 async def dice_handler(event):
     arg = (event.pattern_match.group(1) or "").strip()
     if not arg.isdigit() or not (1 <= int(arg) <= 6):
         return await event.edit(f"مثال: `{PREFIX}تاس 4` (عدد باید بین ۱ تا ۶ باشه)")
     target = int(arg)
+    chat_id = event.chat_id
     await event.delete()
 
+    last_value = None
     for _ in range(DICE_MAX_ATTEMPTS):
         try:
-            msg = await client.send_message(event.chat_id, file=InputMediaDice("🎲"))
+            msg, value = await _roll_real_dice(chat_id)
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds)
             continue
         except Exception as e:
-            return await client.send_message(event.chat_id, f"❌ خطا در ارسال تاس: {e}")
+            return await client.send_message(chat_id, f"❌ خطا در ارسال تاس: {e}")
 
-        value = getattr(msg.media, "value", None)
+        last_value = value
         if value == target:
             return  # تاس با عدد درست موند، تمام
 
@@ -609,10 +624,12 @@ async def dice_handler(event):
             await msg.delete()
         except Exception:
             pass
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
 
     await client.send_message(
-        event.chat_id, f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم"
+        chat_id,
+        f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم "
+        f"(آخرین عددی که اومد: {last_value})",
     )
 
 
@@ -819,7 +836,13 @@ async def assistant_handler(event):
             return await event.edit(f"مثال: `{PREFIX}assistant mode auto` (auto/mention/pm/groups)")
         assistant_state["mode"] = m
         save_assistant()
-        return await event.edit(f"✅ حالت روی `{m}` تنظیم شد")
+        warn = ""
+        if m == "auto":
+            warn = (
+                "\n⚠️ توجه: توی این حالت به همه‌ی پیام‌های هر چتی (حتی بدون تگ/ریپلای) "
+                "جواب می‌ده - توی گروه‌های شلوغ ممکنه شبیه اسپم به‌نظر برسه."
+            )
+        return await event.edit(f"✅ حالت روی `{m}` تنظیم شد{warn}")
 
     if sub == "exclude":
         assistant_state["exclude"].add(event.chat_id)
@@ -847,8 +870,7 @@ async def assistant_autoreply(event):
     if not assistant_state["enabled"] or not assistant_state["text"]:
         return
     sender_id = event.sender_id
-    me = await client.get_me()
-    if sender_id is None or sender_id == me.id:
+    if sender_id is None or sender_id == SELF_ID:
         return
     if not _assistant_should_respond(event):
         return
@@ -1194,18 +1216,18 @@ async def clock_updater():
     while True:
         now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
         if clock_state["enabled"] and now.minute % interval_minutes == 0:
-            base = (await _refresh_base_name())[:40]
-            key = (clock_state["style"], base, now.hour, now.minute)
-            if key != last_sent:
-                clock_part = CLOCK_STYLES[clock_state["style"]](now.hour, now.minute)
-                new_name = f"{base} | {clock_part}"
-                try:
+            try:
+                base = (await _refresh_base_name())[:40]
+                key = (clock_state["style"], base, now.hour, now.minute)
+                if key != last_sent:
+                    clock_part = CLOCK_STYLES[clock_state["style"]](now.hour, now.minute)
+                    new_name = f"{base} | {clock_part}"
                     await client(functions.account.UpdateProfileRequest(first_name=new_name))
                     last_sent = key
-                except errors.FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except Exception as e:
-                    print("خطا در بروزرسانی ساعت:", e)
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                print("خطا در بروزرسانی ساعت:", e)
         # صبر تا دقیقاً لحظه‌ی شروع دقیقه‌ی بعدی (نه یک فاصله‌ی ثابت و بی‌ربط به ساعت واقعی)
         now2 = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
         await asyncio.sleep(max(60 - now2.second, 1))
@@ -1216,7 +1238,9 @@ async def clock_updater():
 # ---------------------------------------------------------------------------
 
 async def main():
+    global SELF_ID
     me = await client.get_me()
+    SELF_ID = me.id
     print(f"✅ سلف‌بات با اکانت {me.first_name} روشن شد")
     client.loop.create_task(clock_updater())
     client.loop.create_task(autopost_worker())
