@@ -57,6 +57,8 @@ def load_assistant():
         "delay": 3,
         "include": [],
         "exclude": [],
+        "auto_detect": True,  # اگه False باشه، یعنی کاربر دستی قفلش کرده و تشخیص خودکار دست بهش نمی‌زنه
+        "manual_enabled": False,  # فقط وقتی auto_detect=False معتبره
     }
     if os.path.exists(ASSISTANT_FILE):
         with open(ASSISTANT_FILE, "r", encoding="utf-8") as f:
@@ -75,6 +77,8 @@ def save_assistant():
         "delay": assistant_state["delay"],
         "include": list(assistant_state["include"]),
         "exclude": list(assistant_state["exclude"]),
+        "auto_detect": assistant_state["auto_detect"],
+        "manual_enabled": assistant_state["enabled"] if not assistant_state["auto_detect"] else False,
     }
     with open(ASSISTANT_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -82,7 +86,10 @@ def save_assistant():
 
 _assistant_loaded = load_assistant()
 assistant_state = {
-    "enabled": False,  # این رو تسک پس‌زمینه‌ی تشخیص آنلاین/آفلاین خودش مدیریت می‌کنه
+    # اگه auto_detect خاموش باشه، وضعیت اولیه همون چیزیه که کاربر دستی قفل کرده بود؛
+    # وگرنه False می‌مونه تا تسک پس‌زمینه‌ی تشخیص آنلاین/آفلاین خودش تعیینش کنه
+    "enabled": _assistant_loaded["manual_enabled"] if not _assistant_loaded["auto_detect"] else False,
+    "auto_detect": _assistant_loaded["auto_detect"],
     "mode": _assistant_loaded["mode"],
     "text": _assistant_loaded["text"],
     "delay": _assistant_loaded["delay"],
@@ -633,6 +640,141 @@ async def dice_handler(event):
     )
 
 
+# --- فونت پیام: انگلیسی (یونیکد ریاضی) / فارسی (تزئینی) / ترکیبی ---
+
+def _build_latin_map(upper_start, lower_start, digit_start=None, exceptions=None):
+    """
+    یه نگاشت A-Z/a-z (و اختیاری ۰-۹) به یه بلاک یونیکد پیوسته می‌سازه.
+    exceptions برای حروفی که یونیکد به‌جای بلاک اصلی از نمادهای قدیمی‌تر
+    استفاده کرده (مثلاً اسکریپت یا فراکتور) به کار می‌ره.
+    """
+    exceptions = exceptions or {}
+    mapping = {}
+    for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+        mapping[ch] = exceptions.get(ch, chr(upper_start + i))
+    for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        mapping[ch] = exceptions.get(ch, chr(lower_start + i))
+    if digit_start is not None:
+        for i, ch in enumerate("0123456789"):
+            mapping[ch] = chr(digit_start + i)
+    return mapping
+
+
+_BOLD_MAP = _build_latin_map(0x1D400, 0x1D41A, 0x1D7CE)
+_ITALIC_MAP = _build_latin_map(0x1D434, 0x1D44E, exceptions={"h": "\u210E"})
+_BOLD_ITALIC_MAP = _build_latin_map(0x1D468, 0x1D482)
+_SCRIPT_MAP = _build_latin_map(0x1D49C, 0x1D4B6, exceptions={
+    "B": "\u212C", "E": "\u2130", "F": "\u2131", "H": "\u210B", "I": "\u2110",
+    "L": "\u2112", "M": "\u2133", "R": "\u211B",
+    "e": "\u212F", "g": "\u210A", "o": "\u2134",
+})
+_FRAKTUR_MAP = _build_latin_map(0x1D504, 0x1D51E, exceptions={
+    "C": "\u212D", "H": "\u210C", "I": "\u2111", "R": "\u211C", "Z": "\u2128",
+})
+_SANS_BOLD_MAP = _build_latin_map(0x1D5D4, 0x1D5EE, 0x1D7EC)
+_MONO_MAP = _build_latin_map(0x1D670, 0x1D68A, 0x1D7F6)
+_CIRCLED_MAP = _build_latin_map(0x24B6, 0x24D0)
+
+_SMALLCAPS_MAP = {
+    "a": "\u1D00", "b": "\u0299", "c": "\u1D04", "d": "\u1D05", "e": "\u1D07",
+    "f": "\uA730", "g": "\u0262", "h": "\u029C", "i": "\u026A", "j": "\u1D0A",
+    "k": "\u1D0B", "l": "\u029F", "m": "\u1D0D", "n": "\u0274", "o": "\u1D0F",
+    "p": "\u1D18", "q": "q", "r": "\u0280", "s": "s", "t": "\u1D1B",
+    "u": "\u1D1C", "v": "\u1D20", "w": "\u1D21", "x": "x", "y": "\u028F", "z": "\u1D22",
+}
+for _c in list(_SMALLCAPS_MAP.keys()):
+    _SMALLCAPS_MAP[_c.upper()] = _SMALLCAPS_MAP[_c]
+
+_FLIP_MAP = {
+    "a": "ɐ", "b": "q", "c": "ɔ", "d": "p", "e": "ǝ", "f": "ɟ", "g": "ƃ",
+    "h": "ɥ", "i": "ᴉ", "j": "ɾ", "k": "ʞ", "l": "l", "m": "ɯ", "n": "u",
+    "o": "o", "p": "d", "q": "b", "r": "ɹ", "s": "s", "t": "ʇ", "u": "n",
+    "v": "ʌ", "w": "ʍ", "x": "x", "y": "ʎ", "z": "z",
+    "0": "0", "1": "Ɩ", "2": "ᄅ", "3": "Ɛ", "4": "ㄣ", "5": "ϛ", "6": "9",
+    "7": "ㄥ", "8": "8", "9": "6", "?": "¿", "!": "¡",
+}
+for _c in list(_FLIP_MAP.keys()):
+    if _c.isalpha():
+        _FLIP_MAP[_c.upper()] = _FLIP_MAP[_c]
+
+
+def _apply_map(text, mapping):
+    return "".join(mapping.get(ch, ch) for ch in text)
+
+
+def _flip_text(text):
+    return "".join(_FLIP_MAP.get(ch, ch) for ch in text)[::-1]
+
+
+def _persian_spaced(t):
+    return " ".join(list(t))
+
+
+_ENGLISH_FONTS = {
+    "bold": lambda t: _apply_map(t, _BOLD_MAP),
+    "italic": lambda t: _apply_map(t, _ITALIC_MAP),
+    "bold_italic": lambda t: _apply_map(t, _BOLD_ITALIC_MAP),
+    "script": lambda t: _apply_map(t, _SCRIPT_MAP),
+    "fraktur": lambda t: _apply_map(t, _FRAKTUR_MAP),
+    "sans_bold": lambda t: _apply_map(t, _SANS_BOLD_MAP),
+    "monospace": lambda t: _apply_map(t, _MONO_MAP),
+    "smallcaps": lambda t: _apply_map(t, _SMALLCAPS_MAP),
+    "circled": lambda t: _apply_map(t, _CIRCLED_MAP),
+    "upside_down": _flip_text,
+}
+
+_PERSIAN_FONTS = {
+    "fa_spaced": _persian_spaced,
+    "fa_stars": lambda t: f"✦ {t} ✦",
+    "fa_flowers": lambda t: f"⋆｡°✩ {t} ✩°｡⋆",
+    "fa_brackets": lambda t: f"『{t}』",
+    "fa_elegant": lambda t: f"⟪ {t} ⟫",
+}
+
+_COMBINED_FONTS = {
+    "mix_bold": lambda t: f"✦ {_apply_map(t, _BOLD_MAP)} ✦",
+    "mix_italic": lambda t: f"『{_apply_map(t, _ITALIC_MAP)}』",
+    "mix_script": lambda t: f"⟪ {_apply_map(t, _SCRIPT_MAP)} ⟫",
+    "mix_mono": lambda t: f"⌗ {_apply_map(t, _MONO_MAP)} ⌗",
+}
+
+FONT_STYLES = {**_ENGLISH_FONTS, **_PERSIAN_FONTS, **_COMBINED_FONTS}
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat("font")))
+async def font_handler(event):
+    raw = (event.pattern_match.group(1) or "").strip()
+    parts = raw.split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1] if len(parts) > 1 else ""
+
+    if not sub or sub == "list":
+        sample = "Text متن"
+        lines = ["🔤 **فونت‌های موجود** (نمونه با «Text متن»):\n", "**انگلیسی:**"]
+        for name in _ENGLISH_FONTS:
+            lines.append(f"▫️ `{name}` → {FONT_STYLES[name](sample)}")
+        lines.append("\n**فارسی:**")
+        for name in _PERSIAN_FONTS:
+            lines.append(f"▫️ `{name}` → {FONT_STYLES[name](sample)}")
+        lines.append("\n**ترکیبی:**")
+        for name in _COMBINED_FONTS:
+            lines.append(f"▫️ `{name}` → {FONT_STYLES[name](sample)}")
+        lines.append(f"\nاستفاده: `{PREFIX}font <نام> <متن>` یا ریپلای + `{PREFIX}font <نام>`")
+        return await event.edit("\n".join(lines))
+
+    if sub not in FONT_STYLES:
+        return await event.edit(f"فونت نامعتبره. برای لیست: `{PREFIX}font list`")
+
+    text = rest
+    if not text and event.is_reply:
+        reply = await event.get_reply_message()
+        text = reply.raw_text or ""
+    if not text:
+        return await event.edit(f"مثال: `{PREFIX}font {sub} متن شما`")
+
+    await event.edit(FONT_STYLES[sub](text))
+
+
 # ---------------------------------------------------------------------------
 # ۶) پروفایل: setbio / setname / setpic / clock
 # ---------------------------------------------------------------------------
@@ -756,18 +898,25 @@ _ASSISTANT_MODE_FA = {
 def _assistant_status_text():
     status = "روشن ✅" if assistant_state["enabled"] else "خاموش ❌"
     mode_fa = _ASSISTANT_MODE_FA.get(assistant_state["mode"], assistant_state["mode"])
+    if assistant_state["auto_detect"]:
+        control_line = f"خودکار (بر اساس آنلاین/آفلاین‌بودنت، هر {ASSISTANT_CHECK_INTERVAL} ثانیه چک می‌شه)"
+        footer = (
+            f"با `{PREFIX}assistant on` یا `{PREFIX}assistant off` می‌تونی دستی قفلش کنی "
+            "(از اون به بعد حتی اگه آنلاین/آفلاین بشی، تشخیص خودکار دیگه دست بهش نمی‌زنه)."
+        )
+    else:
+        control_line = "دستی 🔒 (قفل‌شده - تشخیص آنلاین/آفلاین روش تاثیری نداره)"
+        footer = f"برای برگردوندن به تشخیص خودکار: `{PREFIX}assistant auto`"
     return (
         "🤖 **منشی چت**\n\n"
         f"• وضعیت: {status}\n"
-        f"• حالت: {mode_fa}\n"
+        f"• کنترل: {control_line}\n"
+        f"• حالت پاسخ: {mode_fa}\n"
         f"• تأخیر پاسخ: {assistant_state['delay']} ثانیه\n"
         f"• متن: {assistant_state['text'] or '(تنظیم نشده)'}\n"
         f"• چت‌های مستثنی: {len(assistant_state['exclude'])}\n"
         f"• چت‌های همیشه‌فعال: {len(assistant_state['include'])}\n\n"
-        f"تشخیص آنلاین/آفلاین خودکاره (هر {ASSISTANT_CHECK_INTERVAL} ثانیه چک می‌شه): "
-        "وقتی خودت (مثلاً از گوشی) فعال باشی خاموش می‌مونه، وقتی واقعاً آفلاین "
-        f"باشی خودش روشن می‌شه. با `{PREFIX}assistant on/off` می‌تونی دستی override "
-        "کنی، ولی توجه کن با اولین فعالیت واقعی‌ات دوباره خودکار اصلاح می‌شه."
+        f"{footer}"
     )
 
 
@@ -805,12 +954,24 @@ async def assistant_handler(event):
 
     if sub == "on":
         assistant_state["enabled"] = True
+        assistant_state["auto_detect"] = False  # قفل دستی - تشخیص خودکار دیگه دست بهش نمی‌زنه
         assistant_state["replied"] = set()
+        save_assistant()
         return await event.edit(_assistant_status_text())
 
     if sub == "off":
         assistant_state["enabled"] = False
+        assistant_state["auto_detect"] = False  # قفل دستی - حتی اگه آفلاین بشی خاموش می‌مونه
+        save_assistant()
         return await event.edit(_assistant_status_text())
+
+    if sub == "auto":
+        assistant_state["auto_detect"] = True
+        save_assistant()
+        return await event.edit(
+            "✅ تشخیص خودکار آنلاین/آفلاین دوباره فعال شد.\n"
+            "از این به بعد روشن/خاموش‌بودن منشی خودش بر اساس آنلاین/آفلاین‌بودنت مدیریت می‌شه."
+        )
 
     if sub == "text":
         text = rest
@@ -894,8 +1055,14 @@ async def assistant_status_watcher():
     از تلگرام می‌گیره. اگه سشنی غیر از همین اسکریپت (مثلاً گوشی خودت) به‌تازگی
     فعال بوده باشه، یعنی خودت آنلاینی -> منشی خاموش می‌شه. اگه هیچ سشن دیگه‌ای
     به‌تازگی فعال نبوده -> یعنی آفلاینی -> منشی خودش روشن می‌شه.
+
+    اگه با .assistant on یا .assistant off دستی قفلش کرده باشی (auto_detect
+    خاموش)، این تابع اصلاً دست به enabled نمی‌زنه - حتی اگه آفلاین بشی.
     """
     while True:
+        if not assistant_state["auto_detect"]:
+            await asyncio.sleep(ASSISTANT_CHECK_INTERVAL)
+            continue
         try:
             result = await client(functions.account.GetAuthorizationsRequest())
             others = [a for a in result.authorizations if not a.current]
@@ -1155,6 +1322,8 @@ def build_help_text():
 {PREFIX}reverse <متن> — معکوس کردن متن
 {PREFIX}mock <متن> — mOcKiNg CaSe
 {PREFIX}تاس <۱ تا ۶> — انداختن تاس واقعی تا رسیدن به همون عدد
+{PREFIX}font list — لیست فونت‌های موجود (انگلیسی/فارسی/ترکیبی)
+{PREFIX}font <نام> <متن> — تبدیل متن به فونت انتخابی
 
 **پروفایل**
 {PREFIX}setbio <متن> — تغییر بیو
@@ -1165,7 +1334,8 @@ def build_help_text():
 {PREFIX}clockstyle <نام>/next — تغییر استایل ساعت
 
 **🤖 منشی چت**
-{PREFIX}assistant on/off — روشن/خاموش کردن منشی
+{PREFIX}assistant on/off — روشن/خاموش کردن دستی (قفل می‌شه، تشخیص خودکار غیرفعال می‌شه)
+{PREFIX}assistant auto — برگشت به تشخیص خودکار آنلاین/آفلاین
 {PREFIX}assistant status — نمایش وضعیت منشی
 {PREFIX}assistant text <متن> — تنظیم پیام پاسخ
 {PREFIX}assistant delay <ثانیه> — تنظیم تأخیر
