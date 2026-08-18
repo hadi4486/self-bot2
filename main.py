@@ -39,6 +39,7 @@ NOTES_FILE = os.getenv("NOTES_FILE", "notes.json")  # اگه Volume وصل کر�
 AUTOPOST_FILE = os.getenv("AUTOPOST_FILE", "autopost.json")  # اگه Volume وصل کردی: مثلاً /data/autopost.json
 AUTOPOST_MIN_INTERVAL_MINUTES = 1  # حداقل فاصله مجاز - برای کاهش ریسک اسپم بهتره کمتر از ۵ نذاری
 ASSISTANT_FILE = os.getenv("ASSISTANT_FILE", "assistant.json")  # اگه Volume وصل کردی: مثلاً /data/assistant.json
+FONT_STATE_FILE = os.getenv("FONT_STATE_FILE", "font_state.json")  # اگه Volume وصل کردی: مثلاً /data/font_state.json
 ASSISTANT_ONLINE_THRESHOLD = int(os.getenv("ASSISTANT_ONLINE_THRESHOLD", "180"))  # ثانیه - آستانه‌ی تشخیص آنلاین‌بودن
 ASSISTANT_CHECK_INTERVAL = max(int(os.getenv("ASSISTANT_CHECK_INTERVAL", "30")), 15)  # هر چند ثانیه وضعیت چک بشه
 
@@ -710,6 +711,39 @@ def _persian_spaced(t):
     return " ".join(list(t))
 
 
+# حروفی که فقط به حرفِ قبلی می‌چسبن، نه به حرفِ بعدی - نباید بعدشون تطویل بذاریم
+_NON_FORWARD_JOIN = set("اآدذرزژو")
+
+
+def _persian_kashida(t):
+    """
+    کشیدگی واقعی حروف با تطویل عربی (ـ) - همون تکنیکی که توی چاپ و خوشنویسی
+    فارسی/عربی برای کشیده‌کردن کلمات استفاده می‌شه. برخلاف نمادهای تزئینی،
+    این یه کاراکتر استاندارد و پشتیبانی‌شده روی همه‌ی گوشی‌هاست.
+    """
+    chars = list(t)
+    out = []
+    for i, ch in enumerate(chars):
+        out.append(ch)
+        is_persian = "\u0600" <= ch <= "\u06FF"
+        next_is_persian = i < len(chars) - 1 and "\u0600" <= chars[i + 1] <= "\u06FF"
+        if is_persian and ch not in _NON_FORWARD_JOIN and next_is_persian:
+            out.append("\u0640")  # ـ تطویل
+    return "".join(out)
+
+
+def _combining_style(t, mark):
+    return "".join(ch + mark if ch != " " else ch for ch in t)
+
+
+def _persian_underline(t):
+    return _combining_style(t, "\u0332")  # زیرخط واقعی روی هر حرف
+
+
+def _persian_strike(t):
+    return _combining_style(t, "\u0336")  # خط‌خوردگی واقعی روی هر حرف
+
+
 _ENGLISH_FONTS = {
     "bold": lambda t: _apply_map(t, _BOLD_MAP),
     "italic": lambda t: _apply_map(t, _ITALIC_MAP),
@@ -724,11 +758,19 @@ _ENGLISH_FONTS = {
 }
 
 _PERSIAN_FONTS = {
+    "fa_kashida": _persian_kashida,   # کشیدگی واقعی با تطویل - رندر درست همه‌جا
+    "fa_underline": _persian_underline,  # زیرخط واقعی روی تک‌تک حروف
+    "fa_strike": _persian_strike,     # خط‌خوردگی واقعی روی تک‌تک حروف
     "fa_spaced": _persian_spaced,
     "fa_stars": lambda t: f"✦ {t} ✦",
     "fa_flowers": lambda t: f"⋆｡°✩ {t} ✩°｡⋆",
     "fa_brackets": lambda t: f"『{t}』",
     "fa_elegant": lambda t: f"⟪ {t} ⟫",
+    "fa_ribbon": lambda t: f"⸙ {t} ⸙",
+    "fa_diamond": lambda t: f"◈ {t} ◈",
+    "fa_wave": lambda t: f"﹋﹋ {t} ﹋﹋",
+    "fa_boxed": lambda t: f"【{t}】",
+    "fa_hearts": lambda t: f"❀ {t} ❀",
 }
 
 _COMBINED_FONTS = {
@@ -739,6 +781,26 @@ _COMBINED_FONTS = {
 }
 
 FONT_STYLES = {**_ENGLISH_FONTS, **_PERSIAN_FONTS, **_COMBINED_FONTS}
+
+
+def load_font_state():
+    default = {"enabled": False, "style": "bold"}
+    if os.path.exists(FONT_STATE_FILE):
+        with open(FONT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            default.update({k: data.get(k, v) for k, v in default.items()})
+    return default
+
+
+def save_font_state():
+    d = os.path.dirname(FONT_STATE_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(FONT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(font_state, f, ensure_ascii=False, indent=2)
+
+
+font_state = load_font_state()
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat("font")))
@@ -759,8 +821,44 @@ async def font_handler(event):
         lines.append("\n**ترکیبی:**")
         for name in _COMBINED_FONTS:
             lines.append(f"▫️ `{name}` → {FONT_STYLES[name](sample)}")
-        lines.append(f"\nاستفاده: `{PREFIX}font <نام> <متن>` یا ریپلای + `{PREFIX}font <نام>`")
+        lines.append(
+            f"\nاستفاده‌ی یه‌بار: `{PREFIX}font <نام> <متن>` یا ریپلای + `{PREFIX}font <نام>`\n"
+            f"اعمال خودکار روی همه‌ی پیام‌ها: `{PREFIX}font set <نام>` بعد `{PREFIX}font on`"
+        )
         return await event.edit("\n".join(lines))
+
+    if sub == "status":
+        state_fa = "روشن ✅" if font_state["enabled"] else "خاموش ❌"
+        return await event.edit(
+            f"🔤 **فونت خودکار پیام‌ها**\n\n"
+            f"• وضعیت: {state_fa}\n"
+            f"• فونت انتخابی: `{font_state['style']}`\n\n"
+            f"روشن/خاموش: `{PREFIX}font on` / `{PREFIX}font off`\n"
+            f"تغییر فونت: `{PREFIX}font set <نام>`"
+        )
+
+    if sub == "set":
+        name = rest.strip().lower()
+        if name not in FONT_STYLES:
+            return await event.edit(f"فونت نامعتبره. برای لیست: `{PREFIX}font list`")
+        font_state["style"] = name
+        save_font_state()
+        return await event.edit(f"✅ فونت پیش‌فرض روی `{name}` تنظیم شد")
+
+    if sub == "on":
+        font_state["enabled"] = True
+        save_font_state()
+        return await event.edit(
+            f"✅ فونت خودکار روشن شد (فونت: `{font_state['style']}`)\n"
+            "از الان، هر پیام عادی‌ای که بفرستی (نه دستورها) خودکار با این فونت "
+            "ارسال می‌شه. توجه: چون پیام اول واقعی فرستاده می‌شه و بعد ادیت می‌شه، "
+            "یه لحظه‌ی خیلی کوتاه متن اصلی قابل‌دیدنه."
+        )
+
+    if sub == "off":
+        font_state["enabled"] = False
+        save_font_state()
+        return await event.edit("✅ فونت خودکار خاموش شد")
 
     if sub not in FONT_STYLES:
         return await event.edit(f"فونت نامعتبره. برای لیست: `{PREFIX}font list`")
@@ -773,6 +871,26 @@ async def font_handler(event):
         return await event.edit(f"مثال: `{PREFIX}font {sub} متن شما`")
 
     await event.edit(FONT_STYLES[sub](text))
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def font_autoapply(event):
+    """
+    وقتی فونت خودکار روشنه، این هندلر روی *هر* پیام معمولی‌ای که می‌فرستی
+    (نه دستورهای ربات که با پیشوند شروع می‌شن) فونت انتخابی رو اعمال می‌کنه.
+    """
+    if not font_state["enabled"]:
+        return
+    text = event.raw_text
+    if not text or text.startswith(PREFIX):
+        return  # دستورهای خودِ ربات رو دست نمی‌زنیم
+    style = font_state["style"]
+    if style not in FONT_STYLES:
+        return
+    try:
+        await event.edit(FONT_STYLES[style](text))
+    except Exception as e:
+        print("خطا در اعمال خودکار فونت:", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1323,7 +1441,10 @@ def build_help_text():
 {PREFIX}mock <متن> — mOcKiNg CaSe
 {PREFIX}تاس <۱ تا ۶> — انداختن تاس واقعی تا رسیدن به همون عدد
 {PREFIX}font list — لیست فونت‌های موجود (انگلیسی/فارسی/ترکیبی)
-{PREFIX}font <نام> <متن> — تبدیل متن به فونت انتخابی
+{PREFIX}font <نام> <متن> — تبدیل یه‌بارِ متن به فونت انتخابی
+{PREFIX}font set <نام> — تنظیم فونت پیش‌فرض برای حالت خودکار
+{PREFIX}font on/off — روشن/خاموش کردن اعمال خودکار فونت روی همه‌ی پیام‌ها
+{PREFIX}font status — وضعیت فونت خودکار
 
 **پروفایل**
 {PREFIX}setbio <متن> — تغییر بیو
