@@ -597,12 +597,37 @@ async def _roll_real_dice(chat_id):
     """
     یه تاس واقعی می‌فرسته. برای اطمینان از خوندن درستِ عدد نتیجه، به‌جای اتکا
     به آبجکتی که مستقیم از send_file برمی‌گرده (که بعضی‌وقت‌ها media توش کامل
-    پر نشده)، پیام رو یک‌بار دیگه از خودِ سرور تلگرام می‌خونیم.
+    پر نشده)، پیام رو یک‌بار دیگه از خودِ سرور تلگرام می‌خونیم. اگه به هر دلیلی
+    خوندن مجدد جواب نداد، حداقل خودِ پیامِ اول رو برای حذف/بررسی برمی‌گردونیم.
     """
     sent = await client.send_file(chat_id, InputMediaDice("🎲"))
     fresh = await client.get_messages(chat_id, ids=sent.id)
+    msg = fresh or sent
     value = getattr(getattr(fresh, "media", None), "value", None)
-    return fresh, value
+    if value is None:
+        value = getattr(getattr(sent, "media", None), "value", None)
+    return msg, value
+
+
+async def _safe_batch_delete(chat_id, ids, max_retries=3):
+    """
+    حذف دسته‌جمعیِ پیام‌ها به‌جای حذف تک‌تک - هم API-call کمتری می‌خواد و هم
+    خیلی کمتر به محدودیت فلود تلگرام می‌خوره. اگه فلود خورد، به‌جای بی‌خیال‌شدن
+    (که باعث باقی‌موندن تاس‌های اشتباه توی چت می‌شد)، واقعاً صبر می‌کنه و
+    دوباره امتحان می‌کنه.
+    """
+    if not ids:
+        return
+    for attempt in range(max_retries):
+        try:
+            await client.delete_messages(chat_id, ids)
+            return
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            print(f"خطا در حذف دسته‌جمعی پیام‌های تاس (تلاش {attempt + 1}):", e)
+            await asyncio.sleep(1)
+    print(f"⚠️ نتونستم {len(ids)} پیام تاس رو بعد از {max_retries} تلاش حذف کنم")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat("تاس")))
@@ -614,7 +639,10 @@ async def dice_handler(event):
     chat_id = event.chat_id
     await event.delete()
 
+    all_ids = []  # آیدیِ همه‌ی تاس‌هایی که تا الان فرستادیم
     last_value = None
+    winning_id = None
+
     for _ in range(DICE_MAX_ATTEMPTS):
         try:
             msg, value = await _roll_real_dice(chat_id)
@@ -622,23 +650,28 @@ async def dice_handler(event):
             await asyncio.sleep(e.seconds)
             continue
         except Exception as e:
+            await _safe_batch_delete(chat_id, all_ids)
             return await client.send_message(chat_id, f"❌ خطا در ارسال تاس: {e}")
 
+        all_ids.append(msg.id)
         last_value = value
+
         if value == target:
-            return  # تاس با عدد درست موند، تمام
+            winning_id = msg.id
+            break
 
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.8)
 
-    await client.send_message(
-        chat_id,
-        f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم "
-        f"(آخرین عددی که اومد: {last_value})",
-    )
+    # همه‌ی تاس‌های اشتباه رو یک‌جا پاک کن (چه به عدد درست رسیده باشیم چه نه)
+    ids_to_delete = [i for i in all_ids if i != winning_id]
+    await _safe_batch_delete(chat_id, ids_to_delete)
+
+    if winning_id is None:
+        await client.send_message(
+            chat_id,
+            f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم "
+            f"(آخرین عددی که اومد: {last_value})",
+        )
 
 
 # --- فونت پیام: انگلیسی (یونیکد ریاضی) / فارسی (تزئینی) / ترکیبی ---
