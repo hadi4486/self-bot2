@@ -42,6 +42,8 @@ ASSISTANT_FILE = os.getenv("ASSISTANT_FILE", "assistant.json")  # اگه Volume 
 FONT_STATE_FILE = os.getenv("FONT_STATE_FILE", "font_state.json")  # اگه Volume وصل کردی: مثلاً /data/font_state.json
 ASSISTANT_ONLINE_THRESHOLD = int(os.getenv("ASSISTANT_ONLINE_THRESHOLD", "180"))  # ثانیه - آستانه‌ی تشخیص آنلاین‌بودن
 ASSISTANT_CHECK_INTERVAL = max(int(os.getenv("ASSISTANT_CHECK_INTERVAL", "30")), 15)  # هر چند ثانیه وضعیت چک بشه
+STATS_FILE = os.getenv("STATS_FILE", "stats.json")  # اگه Volume وصل کردی: مثلاً /data/stats.json
+STATS_SAVE_INTERVAL = 60  # هر چند ثانیه آمار روی دیسک ذخیره بشه
 
 if SESSION_STRING:
     from telethon.sessions import StringSession
@@ -129,15 +131,90 @@ def _reset_autopost_timer():
 
 
 # ---------------------------------------------------------------------------
+# آمار سلف‌بات
+# ---------------------------------------------------------------------------
+
+def load_stats():
+    default = {
+        "commands_total": 0,
+        "commands_by_name": {},          # نام فارسی دستور -> تعداد اجرا
+        "messages_total": 0,             # همه‌ی پیام‌های دیده‌شده (ورودی+خروجی)
+        "autopost_ok": 0,
+        "autopost_fail": 0,
+        "errors": 0,                     # فقط خطاهای سیستمی/پس‌زمینه، نه خطاهای ورودی کاربر
+        "per_chat": {},                  # chat_id (رشته) -> {"messages": n, "commands": n, "title": ...}
+    }
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                default.update({k: data.get(k, v) for k, v in default.items()})
+        except Exception as e:
+            print("خطا در خواندن فایل آمار:", e)
+    return default
+
+
+def save_stats():
+    d = os.path.dirname(STATS_FILE)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATS, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("خطا در ذخیره‌ی فایل آمار:", e)
+
+
+STATS = load_stats()
+
+
+def _chat_stats(chat_id):
+    key = str(chat_id)
+    return STATS["per_chat"].setdefault(key, {"messages": 0, "commands": 0, "title": None})
+
+
+def _record_error():
+    STATS["errors"] += 1
+
+
+def _record_message(event):
+    STATS["messages_total"] += 1
+    _chat_stats(event.chat_id)["messages"] += 1
+
+
+def _record_command(event, raw_name):
+    canonical = ALL_COMMAND_NAMES.get(raw_name)
+    if not canonical:
+        return  # پیامی که با پیشوند شروع می‌شه ولی دستور واقعی نیست (تایپ اشتباه)
+    STATS["commands_total"] += 1
+    STATS["commands_by_name"][canonical] = STATS["commands_by_name"].get(canonical, 0) + 1
+    chat = _chat_stats(event.chat_id)
+    chat["commands"] += 1
+
+
+# ---------------------------------------------------------------------------
 # ابزارهای کمکی
 # ---------------------------------------------------------------------------
 
+ALL_COMMAND_NAMES = {}  # نام‌مستعار (فارسی/انگلیسی) -> نام اصلیِ فارسی؛ توسط pat() پر می‌شه، برای آمار استفاده می‌شه
+
+
 def pat(name, arg=True):
-    """ساخت الگوی regex برای دستورات خروجی (پیام‌هایی که خودتون می‌فرستید)"""
+    """
+    ساخت الگوی regex برای دستورات خروجی (پیام‌هایی که خودتون می‌فرستید).
+    name می‌تونه یک رشته باشه یا لیستی از نام‌های مترادف برای یک دستور (مثلاً
+    نام فارسیِ جدید + نام انگلیسیِ قدیمی، برای سازگاری با عادت قبلی). اولین
+    عضو لیست به‌عنوان نام اصلی/نمایشی (برای آمار و راهنما) در نظر گرفته می‌شه.
+    """
+    names = list(name) if isinstance(name, (list, tuple)) else [name]
+    canonical = names[0]
+    for n in names:
+        ALL_COMMAND_NAMES[n] = canonical
     esc = re.escape(PREFIX)
+    alt = "|".join(re.escape(n) for n in names)
     if arg:
-        return rf"^{esc}{name}(?:\s+([\s\S]*))?$"
-    return rf"^{esc}{name}$"
+        return rf"^{esc}(?:{alt})(?:\s+([\s\S]*))?$"
+    return rf"^{esc}(?:{alt})$"
 
 
 def load_notes():
@@ -310,7 +387,7 @@ clock_state["style"] = _env_clock_style if _env_clock_style in CLOCK_STYLES else
 # ۱) عمومی: ping / alive / id / info
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("ping", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["پینگ", "ping"], arg=False)))
 async def ping_handler(event):
     start = time.time()
     msg = await event.edit("🏓 Pinging...")
@@ -318,7 +395,7 @@ async def ping_handler(event):
     await msg.edit(f"🏓 Pong!\n⏱ {delta:.0f} ms")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("alive", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["فعال", "alive"], arg=False)))
 async def alive_handler(event):
     uptime = str(timedelta(seconds=int(time.time() - START_TIME)))
     text = (
@@ -330,7 +407,7 @@ async def alive_handler(event):
     await event.edit(text)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("id", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["آیدی", "id"], arg=False)))
 async def id_handler(event):
     text = f"🆔 Chat ID: `{event.chat_id}`\n"
     if event.is_reply:
@@ -340,7 +417,7 @@ async def id_handler(event):
     await event.edit(text)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("info", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["اطلاعات", "info"], arg=False)))
 async def info_handler(event):
     if event.is_reply:
         reply = await event.get_reply_message()
@@ -359,11 +436,11 @@ async def info_handler(event):
 # ۲) ابزار: calc / qr / shorten / weather / tr / google
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("calc")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["حساب", "calc"])))
 async def calc_handler(event):
     expr = event.pattern_match.group(1)
     if not expr:
-        return await event.edit(f"مثال: `{PREFIX}calc 5*(3+2)`")
+        return await event.edit(f"مثال: `{PREFIX}حساب 5*(3+2)`")
     try:
         result = safe_eval(expr)
         await event.edit(f"🧮 `{expr}` = **{result}**")
@@ -371,12 +448,12 @@ async def calc_handler(event):
         await event.edit("❌ عبارت ریاضی نامعتبره")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("qr")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["کیوآر", "qr"])))
 async def qr_handler(event):
     import qrcode
     text = event.pattern_match.group(1)
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}qr https://example.com`")
+        return await event.edit(f"مثال: `{PREFIX}کیوآر https://example.com`")
     img = qrcode.make(text)
     bio = BytesIO()
     bio.name = "qr.png"
@@ -386,11 +463,11 @@ async def qr_handler(event):
     await client.send_file(event.chat_id, bio, caption=f"🔳 QR برای: {text}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("shorten")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["کوتاه", "shorten"])))
 async def shorten_handler(event):
     url = event.pattern_match.group(1)
     if not url:
-        return await event.edit(f"مثال: `{PREFIX}shorten https://example.com/long-link`")
+        return await event.edit(f"مثال: `{PREFIX}کوتاه https://example.com/long-link`")
     try:
         r = requests.get("https://is.gd/create.php",
                           params={"format": "simple", "url": url}, timeout=10)
@@ -399,11 +476,11 @@ async def shorten_handler(event):
         await event.edit("❌ خطا در کوتاه کردن لینک")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("weather")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["هوا", "weather"])))
 async def weather_handler(event):
     city = event.pattern_match.group(1)
     if not city:
-        return await event.edit(f"مثال: `{PREFIX}weather Tehran`")
+        return await event.edit(f"مثال: `{PREFIX}هوا Tehran`")
     try:
         r = requests.get(f"https://wttr.in/{city}?format=%C+%t+%h+%w", timeout=10)
         await event.edit(f"🌤 آب‌وهوای {city}:\n{r.text}")
@@ -411,7 +488,7 @@ async def weather_handler(event):
         await event.edit("❌ خطا در دریافت آب‌وهوا")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("tr")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ترجمه", "tr"])))
 async def translate_handler(event):
     args = event.pattern_match.group(1)
     lang, text = None, None
@@ -422,7 +499,7 @@ async def translate_handler(event):
         reply = await event.get_reply_message()
         text = reply.raw_text
     if not lang or not text:
-        return await event.edit(f"مثال: `{PREFIX}tr en سلام دنیا` یا با ریپلای: `{PREFIX}tr en`")
+        return await event.edit(f"مثال: `{PREFIX}ترجمه en سلام دنیا` یا با ریپلای: `{PREFIX}ترجمه en`")
     try:
         r = requests.get("https://api.mymemory.translated.net/get",
                           params={"q": text, "langpair": f"auto|{lang}"}, timeout=10)
@@ -432,11 +509,11 @@ async def translate_handler(event):
         await event.edit("❌ خطا در ترجمه")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("google")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["جستجو", "google"])))
 async def google_handler(event):
     q = event.pattern_match.group(1)
     if not q:
-        return await event.edit(f"مثال: `{PREFIX}google چطور پایتون یاد بگیرم`")
+        return await event.edit(f"مثال: `{PREFIX}جستجو چطور پایتون یاد بگیرم`")
     link = "https://www.google.com/search?q=" + requests.utils.quote(q)
     await event.edit(f"🔍 نتایج گوگل برای: {q}\n{link}")
 
@@ -445,11 +522,11 @@ async def google_handler(event):
 # ۳) یادداشت‌ها: note / notes / getnote / delnote
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("note")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["یادداشت", "note"])))
 async def note_handler(event):
     args = event.pattern_match.group(1)
     if not args or " " not in args:
-        return await event.edit(f"مثال: `{PREFIX}note keyname متن یادداشت`")
+        return await event.edit(f"مثال: `{PREFIX}یادداشت keyname متن یادداشت`")
     key, text = args.split(" ", 1)
     notes = load_notes()
     notes[key] = text
@@ -457,7 +534,7 @@ async def note_handler(event):
     await event.edit(f"📝 یادداشت `{key}` ذخیره شد")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("notes", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["یادداشت‌ها", "notes"], arg=False)))
 async def notes_list_handler(event):
     notes = load_notes()
     if not notes:
@@ -466,7 +543,7 @@ async def notes_list_handler(event):
     await event.edit(text)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("getnote")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["نمایش‌یادداشت", "getnote"])))
 async def getnote_handler(event):
     key = event.pattern_match.group(1)
     notes = load_notes()
@@ -475,7 +552,7 @@ async def getnote_handler(event):
     await event.edit(f"📝 `{key}`:\n{notes[key]}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("delnote")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["حذف‌یادداشت", "delnote"])))
 async def delnote_handler(event):
     key = event.pattern_match.group(1)
     notes = load_notes()
@@ -490,7 +567,7 @@ async def delnote_handler(event):
 # ۴) مدیریت پیام: del / purge / pin / unpin
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("del", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["حذف", "del"], arg=False)))
 async def del_handler(event):
     if event.is_reply:
         reply = await event.get_reply_message()
@@ -498,7 +575,7 @@ async def del_handler(event):
     await event.delete()
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("purge")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["پاکسازی", "purge"])))
 async def purge_handler(event):
     count_str = event.pattern_match.group(1)
     if event.is_reply:
@@ -514,10 +591,10 @@ async def purge_handler(event):
             ids.append(m.id)
         await client.delete_messages(event.chat_id, ids)
     else:
-        await event.edit(f"مثال: `{PREFIX}purge 10` یا ریپلای روی پیام + `{PREFIX}purge`")
+        await event.edit(f"مثال: `{PREFIX}پاکسازی 10` یا ریپلای روی پیام + `{PREFIX}پاکسازی`")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("pin", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["سنجاق", "pin"], arg=False)))
 async def pin_handler(event):
     if not event.is_reply:
         return await event.edit("روی یک پیام ریپلای کن")
@@ -526,7 +603,7 @@ async def pin_handler(event):
     await event.edit("📌 پین شد")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("unpin", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["برداشتن‌سنجاق", "unpin"], arg=False)))
 async def unpin_handler(event):
     if not event.is_reply:
         return await event.edit("روی یک پیام ریپلای کن")
@@ -539,11 +616,11 @@ async def unpin_handler(event):
 # ۵) سرگرمی: write / type / reverse / mock
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("write")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["تایپ‌زنده", "write"])))
 async def write_handler(event):
     text = event.pattern_match.group(1)
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}write سلام دنیا`")
+        return await event.edit(f"مثال: `{PREFIX}تایپ‌زنده سلام دنیا`")
     current = ""
     msg = await event.edit("▌")
     for ch in text:
@@ -556,36 +633,36 @@ async def write_handler(event):
     await msg.edit(current)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("type")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["پیش‌تایپ", "type"])))
 async def type_handler(event):
     text = event.pattern_match.group(1)
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}type سلام`")
+        return await event.edit(f"مثال: `{PREFIX}پیش‌تایپ سلام`")
     await event.delete()
     async with client.action(event.chat_id, "typing"):
         await asyncio.sleep(min(len(text) * 0.05, 5))
     await client.send_message(event.chat_id, text)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("reverse")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["معکوس", "reverse"])))
 async def reverse_handler(event):
     text = event.pattern_match.group(1)
     if not text and event.is_reply:
         reply = await event.get_reply_message()
         text = reply.raw_text
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}reverse سلام`")
+        return await event.edit(f"مثال: `{PREFIX}معکوس سلام`")
     await event.edit(text[::-1])
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("mock")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["طنز", "mock"])))
 async def mock_handler(event):
     text = event.pattern_match.group(1)
     if not text and event.is_reply:
         reply = await event.get_reply_message()
         text = reply.raw_text
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}mock متن شما`")
+        return await event.edit(f"مثال: `{PREFIX}طنز متن شما`")
     mocked = "".join(c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(text))
     await event.edit(mocked)
 
@@ -597,40 +674,15 @@ async def _roll_real_dice(chat_id):
     """
     یه تاس واقعی می‌فرسته. برای اطمینان از خوندن درستِ عدد نتیجه، به‌جای اتکا
     به آبجکتی که مستقیم از send_file برمی‌گرده (که بعضی‌وقت‌ها media توش کامل
-    پر نشده)، پیام رو یک‌بار دیگه از خودِ سرور تلگرام می‌خونیم. اگه به هر دلیلی
-    خوندن مجدد جواب نداد، حداقل خودِ پیامِ اول رو برای حذف/بررسی برمی‌گردونیم.
+    پر نشده)، پیام رو یک‌بار دیگه از خودِ سرور تلگرام می‌خونیم.
     """
     sent = await client.send_file(chat_id, InputMediaDice("🎲"))
     fresh = await client.get_messages(chat_id, ids=sent.id)
-    msg = fresh or sent
     value = getattr(getattr(fresh, "media", None), "value", None)
-    if value is None:
-        value = getattr(getattr(sent, "media", None), "value", None)
-    return msg, value
+    return fresh, value
 
 
-async def _safe_batch_delete(chat_id, ids, max_retries=3):
-    """
-    حذف دسته‌جمعیِ پیام‌ها به‌جای حذف تک‌تک - هم API-call کمتری می‌خواد و هم
-    خیلی کمتر به محدودیت فلود تلگرام می‌خوره. اگه فلود خورد، به‌جای بی‌خیال‌شدن
-    (که باعث باقی‌موندن تاس‌های اشتباه توی چت می‌شد)، واقعاً صبر می‌کنه و
-    دوباره امتحان می‌کنه.
-    """
-    if not ids:
-        return
-    for attempt in range(max_retries):
-        try:
-            await client.delete_messages(chat_id, ids)
-            return
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            print(f"خطا در حذف دسته‌جمعی پیام‌های تاس (تلاش {attempt + 1}):", e)
-            await asyncio.sleep(1)
-    print(f"⚠️ نتونستم {len(ids)} پیام تاس رو بعد از {max_retries} تلاش حذف کنم")
-
-
-@client.on(events.NewMessage(outgoing=True, pattern=pat("تاس")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["تاس", "dice"])))
 async def dice_handler(event):
     arg = (event.pattern_match.group(1) or "").strip()
     if not arg.isdigit() or not (1 <= int(arg) <= 6):
@@ -639,10 +691,7 @@ async def dice_handler(event):
     chat_id = event.chat_id
     await event.delete()
 
-    all_ids = []  # آیدیِ همه‌ی تاس‌هایی که تا الان فرستادیم
     last_value = None
-    winning_id = None
-
     for _ in range(DICE_MAX_ATTEMPTS):
         try:
             msg, value = await _roll_real_dice(chat_id)
@@ -650,28 +699,24 @@ async def dice_handler(event):
             await asyncio.sleep(e.seconds)
             continue
         except Exception as e:
-            await _safe_batch_delete(chat_id, all_ids)
+            _record_error()
             return await client.send_message(chat_id, f"❌ خطا در ارسال تاس: {e}")
 
-        all_ids.append(msg.id)
         last_value = value
-
         if value == target:
-            winning_id = msg.id
-            break
+            return  # تاس با عدد درست موند، تمام
 
-        await asyncio.sleep(0.8)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
 
-    # همه‌ی تاس‌های اشتباه رو یک‌جا پاک کن (چه به عدد درست رسیده باشیم چه نه)
-    ids_to_delete = [i for i in all_ids if i != winning_id]
-    await _safe_batch_delete(chat_id, ids_to_delete)
-
-    if winning_id is None:
-        await client.send_message(
-            chat_id,
-            f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم "
-            f"(آخرین عددی که اومد: {last_value})",
-        )
+    await client.send_message(
+        chat_id,
+        f"❌ بعد از {DICE_MAX_ATTEMPTS} تلاش نتونستم عدد {target} رو بیارم "
+        f"(آخرین عددی که اومد: {last_value})",
+    )
 
 
 # --- فونت پیام: انگلیسی (یونیکد ریاضی) / فارسی (تزئینی) / ترکیبی ---
@@ -836,14 +881,14 @@ def save_font_state():
 font_state = load_font_state()
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("font")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["قلم", "font"])))
 async def font_handler(event):
     raw = (event.pattern_match.group(1) or "").strip()
     parts = raw.split(maxsplit=1)
     sub = parts[0].lower() if parts else ""
     rest = parts[1] if len(parts) > 1 else ""
 
-    if not sub or sub == "list":
+    if not sub or sub in ("فهرست", "list"):
         sample = "Text متن"
         lines = ["🔤 **فونت‌های موجود** (نمونه با «Text متن»):\n", "**انگلیسی:**"]
         for name in _ENGLISH_FONTS:
@@ -855,30 +900,30 @@ async def font_handler(event):
         for name in _COMBINED_FONTS:
             lines.append(f"▫️ `{name}` → {FONT_STYLES[name](sample)}")
         lines.append(
-            f"\nاستفاده‌ی یه‌بار: `{PREFIX}font <نام> <متن>` یا ریپلای + `{PREFIX}font <نام>`\n"
-            f"اعمال خودکار روی همه‌ی پیام‌ها: `{PREFIX}font set <نام>` بعد `{PREFIX}font on`"
+            f"\nاستفاده‌ی یه‌بار: `{PREFIX}قلم <نام> <متن>` یا ریپلای + `{PREFIX}قلم <نام>`\n"
+            f"اعمال خودکار روی همه‌ی پیام‌ها: `{PREFIX}قلم تنظیم <نام>` بعد `{PREFIX}قلم روشن`"
         )
         return await event.edit("\n".join(lines))
 
-    if sub == "status":
+    if sub in ("وضعیت", "status"):
         state_fa = "روشن ✅" if font_state["enabled"] else "خاموش ❌"
         return await event.edit(
             f"🔤 **فونت خودکار پیام‌ها**\n\n"
             f"• وضعیت: {state_fa}\n"
             f"• فونت انتخابی: `{font_state['style']}`\n\n"
-            f"روشن/خاموش: `{PREFIX}font on` / `{PREFIX}font off`\n"
-            f"تغییر فونت: `{PREFIX}font set <نام>`"
+            f"روشن/خاموش: `{PREFIX}قلم روشن` / `{PREFIX}قلم خاموش`\n"
+            f"تغییر فونت: `{PREFIX}قلم تنظیم <نام>`"
         )
 
-    if sub == "set":
+    if sub in ("تنظیم", "set"):
         name = rest.strip().lower()
         if name not in FONT_STYLES:
-            return await event.edit(f"فونت نامعتبره. برای لیست: `{PREFIX}font list`")
+            return await event.edit(f"فونت نامعتبره. برای فهرست: `{PREFIX}قلم فهرست`")
         font_state["style"] = name
         save_font_state()
         return await event.edit(f"✅ فونت پیش‌فرض روی `{name}` تنظیم شد")
 
-    if sub == "on":
+    if sub in ("روشن", "on"):
         font_state["enabled"] = True
         save_font_state()
         return await event.edit(
@@ -888,20 +933,20 @@ async def font_handler(event):
             "یه لحظه‌ی خیلی کوتاه متن اصلی قابل‌دیدنه."
         )
 
-    if sub == "off":
+    if sub in ("خاموش", "off"):
         font_state["enabled"] = False
         save_font_state()
         return await event.edit("✅ فونت خودکار خاموش شد")
 
     if sub not in FONT_STYLES:
-        return await event.edit(f"فونت نامعتبره. برای لیست: `{PREFIX}font list`")
+        return await event.edit(f"فونت نامعتبره. برای فهرست: `{PREFIX}قلم فهرست`")
 
     text = rest
     if not text and event.is_reply:
         reply = await event.get_reply_message()
         text = reply.raw_text or ""
     if not text:
-        return await event.edit(f"مثال: `{PREFIX}font {sub} متن شما`")
+        return await event.edit(f"مثال: `{PREFIX}قلم {sub} متن شما`")
 
     await event.edit(FONT_STYLES[sub](text))
 
@@ -923,6 +968,7 @@ async def font_autoapply(event):
     try:
         await event.edit(FONT_STYLES[style](text))
     except Exception as e:
+        _record_error()
         print("خطا در اعمال خودکار فونت:", e)
 
 
@@ -930,20 +976,20 @@ async def font_autoapply(event):
 # ۶) پروفایل: setbio / setname / setpic / clock
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("setbio")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["بیو", "setbio"])))
 async def setbio_handler(event):
     bio = event.pattern_match.group(1)
     if not bio:
-        return await event.edit(f"مثال: `{PREFIX}setbio بیو جدید`")
+        return await event.edit(f"مثال: `{PREFIX}بیو بیو جدید`")
     await client(functions.account.UpdateProfileRequest(about=bio))
     await event.edit("✅ بیو بروزرسانی شد")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("setname")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["نام", "setname"])))
 async def setname_handler(event):
     name = event.pattern_match.group(1)
     if not name:
-        return await event.edit(f"مثال: `{PREFIX}setname نام جدید`")
+        return await event.edit(f"مثال: `{PREFIX}نام نام جدید`")
     clock_state["base_name"] = name
     if clock_state["enabled"]:
         await _apply_clock_now()
@@ -952,7 +998,7 @@ async def setname_handler(event):
     await event.edit("✅ نام پایه بروزرسانی شد")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("setpic", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["عکس", "setpic"], arg=False)))
 async def setpic_handler(event):
     if not event.is_reply:
         return await event.edit("روی یک عکس ریپلای کن")
@@ -965,17 +1011,17 @@ async def setpic_handler(event):
     await event.edit("✅ عکس پروفایل تغییر کرد")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("clock")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ساعت", "clock"])))
 async def clock_toggle_handler(event):
     arg = (event.pattern_match.group(1) or "").strip().lower()
-    if arg == "off":
+    if arg in ("خاموش", "off"):
         clock_state["enabled"] = False
         await event.edit("🕐 ساعت زنده خاموش شد")
-    elif arg == "on":
+    elif arg in ("روشن", "on"):
         clock_state["enabled"] = True
         await event.edit("🕐 ساعت زنده روشن شد (طی چند ثانیه اعمال می‌شه)")
     else:
-        await event.edit(f"استفاده: `{PREFIX}clock on` یا `{PREFIX}clock off`")
+        await event.edit(f"استفاده: `{PREFIX}ساعت روشن` یا `{PREFIX}ساعت خاموش`")
 
 
 async def _refresh_base_name():
@@ -1004,29 +1050,30 @@ async def _apply_clock_now():
     try:
         await client(functions.account.UpdateProfileRequest(first_name=f"{base} | {clock_part}"))
     except Exception as e:
+        _record_error()
         print("خطا در اعمال فوری استایل ساعت:", e)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("clockstyle")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["شکل‌ساعت", "clockstyle"])))
 async def clockstyle_handler(event):
     arg = (event.pattern_match.group(1) or "").strip().lower()
-    if not arg or arg == "list":
+    if not arg or arg in ("فهرست", "list"):
         now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
         lines = ["🎨 **استایل‌های ساعت زنده:**\n"]
         for name in CLOCK_STYLE_ORDER:
             preview = CLOCK_STYLES[name](now.hour, now.minute)
             marker = "✅" if name == clock_state["style"] else "▫️"
             lines.append(f"{marker} `{name}` → {preview}")
-        lines.append(f"\nبرای تغییر: `{PREFIX}clockstyle <نام>` یا `{PREFIX}clockstyle next`")
+        lines.append(f"\nبرای تغییر: `{PREFIX}شکل‌ساعت <نام>` یا `{PREFIX}شکل‌ساعت بعدی`")
         return await event.edit("\n".join(lines))
 
-    if arg == "next":
+    if arg in ("بعدی", "next"):
         idx = CLOCK_STYLE_ORDER.index(clock_state["style"])
         new_style = CLOCK_STYLE_ORDER[(idx + 1) % len(CLOCK_STYLE_ORDER)]
     elif arg in CLOCK_STYLES:
         new_style = arg
     else:
-        return await event.edit(f"استایل نامعتبره. برای دیدن لیست: `{PREFIX}clockstyle list`")
+        return await event.edit(f"استایل نامعتبره. برای دیدن فهرست: `{PREFIX}شکل‌ساعت فهرست`")
 
     clock_state["style"] = new_style
     preview = CLOCK_STYLES[new_style](*(datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).timetuple()[3:5])
@@ -1045,6 +1092,15 @@ _ASSISTANT_MODE_FA = {
     "groups": "فقط گروه‌ها",
 }
 
+# ورودیِ کاربر برای «حالت پاسخ» -> کلید داخلیِ همیشگی (auto/mention/pm/groups).
+# هم نسخه‌ی فارسی و هم انگلیسیِ قدیمی رو قبول می‌کنه.
+_ASSISTANT_MODE_ALIASES = {
+    "خودکار": "auto", "auto": "auto",
+    "منشن": "mention", "mention": "mention",
+    "پیوی": "pm", "pm": "pm",
+    "گروه‌ها": "groups", "گروهها": "groups", "groups": "groups",
+}
+
 
 def _assistant_status_text():
     status = "روشن ✅" if assistant_state["enabled"] else "خاموش ❌"
@@ -1052,12 +1108,12 @@ def _assistant_status_text():
     if assistant_state["auto_detect"]:
         control_line = f"خودکار (بر اساس آنلاین/آفلاین‌بودنت، هر {ASSISTANT_CHECK_INTERVAL} ثانیه چک می‌شه)"
         footer = (
-            f"با `{PREFIX}assistant on` یا `{PREFIX}assistant off` می‌تونی دستی قفلش کنی "
+            f"با `{PREFIX}منشی روشن` یا `{PREFIX}منشی خاموش` می‌تونی دستی قفلش کنی "
             "(از اون به بعد حتی اگه آنلاین/آفلاین بشی، تشخیص خودکار دیگه دست بهش نمی‌زنه)."
         )
     else:
         control_line = "دستی 🔒 (قفل‌شده - تشخیص آنلاین/آفلاین روش تاثیری نداره)"
-        footer = f"برای برگردوندن به تشخیص خودکار: `{PREFIX}assistant auto`"
+        footer = f"برای برگردوندن به تشخیص خودکار: `{PREFIX}منشی خودکار`"
     return (
         "🤖 **منشی چت**\n\n"
         f"• وضعیت: {status}\n"
@@ -1093,30 +1149,30 @@ def _assistant_should_respond(event):
     return False
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("assistant")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["منشی", "assistant"])))
 async def assistant_handler(event):
     raw = (event.pattern_match.group(1) or "").strip()
     parts = raw.split(maxsplit=1)
     sub = parts[0].lower() if parts else ""
     rest = parts[1] if len(parts) > 1 else ""
 
-    if not sub or sub == "status":
+    if not sub or sub in ("وضعیت", "status"):
         return await event.edit(_assistant_status_text())
 
-    if sub == "on":
+    if sub in ("روشن", "on"):
         assistant_state["enabled"] = True
         assistant_state["auto_detect"] = False  # قفل دستی - تشخیص خودکار دیگه دست بهش نمی‌زنه
         assistant_state["replied"] = set()
         save_assistant()
         return await event.edit(_assistant_status_text())
 
-    if sub == "off":
+    if sub in ("خاموش", "off"):
         assistant_state["enabled"] = False
         assistant_state["auto_detect"] = False  # قفل دستی - حتی اگه آفلاین بشی خاموش می‌مونه
         save_assistant()
         return await event.edit(_assistant_status_text())
 
-    if sub == "auto":
+    if sub in ("خودکار", "auto"):
         assistant_state["auto_detect"] = True
         save_assistant()
         return await event.edit(
@@ -1124,28 +1180,29 @@ async def assistant_handler(event):
             "از این به بعد روشن/خاموش‌بودن منشی خودش بر اساس آنلاین/آفلاین‌بودنت مدیریت می‌شه."
         )
 
-    if sub == "text":
+    if sub in ("متن", "text"):
         text = rest
         if not text and event.is_reply:
             reply = await event.get_reply_message()
             text = reply.raw_text or ""
         if not text:
-            return await event.edit(f"مثال: `{PREFIX}assistant text سلام، فعلاً آنلاین نیستم`")
+            return await event.edit(f"مثال: `{PREFIX}منشی متن سلام، فعلاً آنلاین نیستم`")
         assistant_state["text"] = text
         save_assistant()
         return await event.edit("✅ متن پاسخ ذخیره شد")
 
-    if sub == "delay":
+    if sub in ("تأخیر", "تاخیر", "delay"):
         if not rest.strip().isdigit():
-            return await event.edit(f"مثال: `{PREFIX}assistant delay 3`")
+            return await event.edit(f"مثال: `{PREFIX}منشی تأخیر 3`")
         assistant_state["delay"] = max(int(rest.strip()), 0)
         save_assistant()
         return await event.edit(f"✅ تأخیر روی {assistant_state['delay']} ثانیه تنظیم شد")
 
-    if sub == "mode":
-        m = rest.strip().lower()
-        if m not in _ASSISTANT_MODE_FA:
-            return await event.edit(f"مثال: `{PREFIX}assistant mode auto` (auto/mention/pm/groups)")
+    if sub in ("حالت", "mode"):
+        m_raw = rest.strip().lower()
+        m = _ASSISTANT_MODE_ALIASES.get(m_raw)
+        if not m:
+            return await event.edit(f"مثال: `{PREFIX}منشی حالت خودکار` (خودکار/منشن/پیوی/گروه‌ها)")
         assistant_state["mode"] = m
         save_assistant()
         warn = ""
@@ -1154,27 +1211,27 @@ async def assistant_handler(event):
                 "\n⚠️ توجه: توی این حالت به همه‌ی پیام‌های هر چتی (حتی بدون تگ/ریپلای) "
                 "جواب می‌ده - توی گروه‌های شلوغ ممکنه شبیه اسپم به‌نظر برسه."
             )
-        return await event.edit(f"✅ حالت روی `{m}` تنظیم شد{warn}")
+        return await event.edit(f"✅ حالت روی `{_ASSISTANT_MODE_FA[m]}` تنظیم شد{warn}")
 
-    if sub == "exclude":
+    if sub in ("مستثنی", "exclude"):
         assistant_state["exclude"].add(event.chat_id)
         assistant_state["include"].discard(event.chat_id)
         save_assistant()
         return await event.edit("🚫 این چت مستثنی شد (منشی اینجا پاسخ نمی‌ده)")
 
-    if sub == "include":
+    if sub in ("شامل", "include"):
         assistant_state["include"].add(event.chat_id)
         assistant_state["exclude"].discard(event.chat_id)
         save_assistant()
         return await event.edit("✅ این چت به لیست همیشه‌فعال اضافه شد")
 
-    if sub == "clear":
+    if sub in ("پاک", "clear"):
         assistant_state["include"].clear()
         assistant_state["exclude"].clear()
         save_assistant()
-        return await event.edit("🗑 لیست include/exclude پاک شد")
+        return await event.edit("🗑 لیست مستثنی/شامل پاک شد")
 
-    await event.edit(f"دستور نامعتبره. برای وضعیت کامل: `{PREFIX}assistant`")
+    await event.edit(f"دستور نامعتبره. برای وضعیت کامل: `{PREFIX}منشی`")
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -1197,6 +1254,7 @@ async def assistant_autoreply(event):
                 await asyncio.sleep(delay)
         await event.reply(assistant_state["text"])
     except Exception as e:
+        _record_error()
         print("خطا در پاسخ خودکار منشی:", e)
 
 
@@ -1230,6 +1288,7 @@ async def assistant_status_watcher():
                     assistant_state["replied"] = set()  # نشست تازه = دوباره به همه جواب بده
                 assistant_state["enabled"] = new_enabled
         except Exception as e:
+            _record_error()
             print("خطا در بررسی وضعیت آنلاین/آفلاین:", e)
         await asyncio.sleep(ASSISTANT_CHECK_INTERVAL)
 
@@ -1238,7 +1297,7 @@ async def assistant_status_watcher():
 # ۸) مدیریت گروه: kick / ban / promote / demote (فقط جایی که ادمین هستید)
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("kick", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["اخراج", "kick"], arg=False)))
 async def kick_handler(event):
     if not event.is_reply:
         return await event.edit("روی پیام کاربر ریپلای کن")
@@ -1247,10 +1306,11 @@ async def kick_handler(event):
         await client.kick_participant(event.chat_id, reply.sender_id)
         await event.edit("✅ کاربر کیک شد")
     except Exception as e:
+        _record_error()
         await event.edit(f"❌ خطا: {e}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("ban", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["مسدود", "ban"], arg=False)))
 async def ban_handler(event):
     if not event.is_reply:
         return await event.edit("روی پیام کاربر ریپلای کن")
@@ -1259,10 +1319,11 @@ async def ban_handler(event):
         await client.edit_permissions(event.chat_id, reply.sender_id, view_messages=False)
         await event.edit("✅ کاربر بن شد")
     except Exception as e:
+        _record_error()
         await event.edit(f"❌ خطا: {e}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("promote")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ارتقا", "promote"])))
 async def promote_handler(event):
     if not event.is_reply:
         return await event.edit("روی پیام کاربر ریپلای کن")
@@ -1272,10 +1333,11 @@ async def promote_handler(event):
         await client.edit_admin(event.chat_id, reply.sender_id, is_admin=True, title=title)
         await event.edit(f"✅ کاربر ادمین شد ({title})")
     except Exception as e:
+        _record_error()
         await event.edit(f"❌ خطا: {e}")
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("demote", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["تنزل", "demote"], arg=False)))
 async def demote_handler(event):
     if not event.is_reply:
         return await event.edit("روی پیام کاربر ریپلای کن")
@@ -1284,6 +1346,7 @@ async def demote_handler(event):
         await client.edit_admin(event.chat_id, reply.sender_id, is_admin=False)
         await event.edit("✅ ادمین کاربر حذف شد")
     except Exception as e:
+        _record_error()
         await event.edit(f"❌ خطا: {e}")
 
 
@@ -1291,7 +1354,7 @@ async def demote_handler(event):
 # ۹) بکاپ گرفتن از پیام‌های یک چت
 # ---------------------------------------------------------------------------
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("backup")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["پشتیبان", "backup"])))
 async def backup_handler(event):
     n_str = event.pattern_match.group(1)
     n = int(n_str) if n_str and n_str.isdigit() else 100
@@ -1323,7 +1386,7 @@ def _autopost_status_text():
         chat_lines = "\n".join(f"   – {title} (`{cid}`)" for cid, title in chats.items())
         dest_line = f"{len(chats)} گروهِ مشخص\n{chat_lines}"
     else:
-        dest_line = f"هیچ‌کدام (اول با `{PREFIX}autopost add` اضافه کن)"
+        dest_line = f"هیچ‌کدام (اول با `{PREFIX}ارسال‌خودکار افزودن` اضافه کن)"
     text_preview = autopost_state["text"] or "(تنظیم نشده)"
     return (
         "🔁 **ارسال خودکار متن**\n\n"
@@ -1331,12 +1394,12 @@ def _autopost_status_text():
         f"• فاصله: {n} دقیقه\n"
         f"• گروه‌های مقصد: {dest_line}\n"
         f"• متن: {text_preview}\n\n"
-        f"راهنما: `{PREFIX}autopost on/off` ، `{PREFIX}autopost interval <عدد>` ، "
-        f"`{PREFIX}autopost text <متن>` ، `{PREFIX}autopost add/remove` ، `{PREFIX}autopost now`"
+        f"راهنما: `{PREFIX}ارسال‌خودکار روشن/خاموش` ، `{PREFIX}ارسال‌خودکار فاصله <عدد>` ، "
+        f"`{PREFIX}ارسال‌خودکار متن <متن>` ، `{PREFIX}ارسال‌خودکار افزودن/حذف` ، `{PREFIX}ارسال‌خودکار فوری`"
     )
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("autopost")))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ارسال‌خودکار", "autopost"])))
 async def autopost_handler(event):
     global _autopost_force_now
 
@@ -1348,24 +1411,24 @@ async def autopost_handler(event):
     if not sub:
         return await event.edit(_autopost_status_text())
 
-    if sub == "on":
+    if sub in ("روشن", "on"):
         if not autopost_state["text"]:
-            return await event.edit(f"❌ اول یه متن ست کن: `{PREFIX}autopost text <متن>`")
+            return await event.edit(f"❌ اول یه متن ست کن: `{PREFIX}ارسال‌خودکار متن <متن>`")
         if not autopost_state["chats"]:
-            return await event.edit(f"❌ اول حداقل یه گروه اضافه کن: `{PREFIX}autopost add` (داخل خود گروه بفرست)")
+            return await event.edit(f"❌ اول حداقل یه گروه اضافه کن: `{PREFIX}ارسال‌خودکار افزودن` (داخل خود گروه بفرست)")
         autopost_state["enabled"] = True
         _reset_autopost_timer()
         save_autopost()
         return await event.edit(_autopost_status_text())
 
-    if sub == "off":
+    if sub in ("خاموش", "off"):
         autopost_state["enabled"] = False
         save_autopost()
         return await event.edit(_autopost_status_text())
 
-    if sub == "interval":
+    if sub in ("فاصله", "interval"):
         if not rest.strip().isdigit():
-            return await event.edit(f"مثال: `{PREFIX}autopost interval 5`")
+            return await event.edit(f"مثال: `{PREFIX}ارسال‌خودکار فاصله 5`")
         n = max(int(rest.strip()), AUTOPOST_MIN_INTERVAL_MINUTES)
         autopost_state["interval_minutes"] = n
         _reset_autopost_timer()
@@ -1373,31 +1436,32 @@ async def autopost_handler(event):
         warn = "" if n >= 5 else "\n⚠️ فاصله‌ی کمتر از ۵ دقیقه ریسک محدودیت از طرف تلگرام رو بالا می‌بره."
         return await event.edit(f"✅ فاصله روی {n} دقیقه تنظیم شد{warn}")
 
-    if sub == "text":
+    if sub in ("متن", "text"):
         text = rest
         if not text and event.is_reply:
             reply = await event.get_reply_message()
             text = reply.raw_text or ""
         if not text:
             return await event.edit(
-                f"مثال: `{PREFIX}autopost text میو` یا ریپلای روی یه پیام + `{PREFIX}autopost text`"
+                f"مثال: `{PREFIX}ارسال‌خودکار متن میو` یا ریپلای روی یه پیام + `{PREFIX}ارسال‌خودکار متن`"
             )
         autopost_state["text"] = text
         save_autopost()
         return await event.edit("✅ متن ارسال خودکار ذخیره شد")
 
-    if sub == "add":
+    if sub in ("افزودن", "add"):
         chat_id = int(rest.strip()) if rest.strip().lstrip("-").isdigit() else event.chat_id
         try:
             chat = await client.get_entity(chat_id)
         except Exception as e:
+            _record_error()
             return await event.edit(f"❌ خطا در پیداکردن چت: {e}")
         title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(chat_id)
         autopost_state["chats"][str(chat_id)] = title
         save_autopost()
         return await event.edit(f"✅ «{title}» به لیست مقصدها اضافه شد")
 
-    if sub == "remove":
+    if sub in ("حذف", "remove"):
         chat_id = int(rest.strip()) if rest.strip().lstrip("-").isdigit() else event.chat_id
         removed = autopost_state["chats"].pop(str(chat_id), None)
         save_autopost()
@@ -1405,16 +1469,16 @@ async def autopost_handler(event):
             return await event.edit(f"🗑 «{removed}» از لیست مقصدها حذف شد")
         return await event.edit("این چت توی لیست مقصدها نبود")
 
-    if sub == "clear":
+    if sub in ("پاک", "clear"):
         autopost_state["chats"].clear()
         save_autopost()
         return await event.edit("🗑 همه‌ی مقصدها پاک شدن")
 
-    if sub == "now":
+    if sub in ("فوری", "now"):
         _autopost_force_now = True
         return await event.edit("⏩ ارسال فوری توی صف قرار گرفت (تا ۵ ثانیه دیگه)")
 
-    await event.edit(f"دستور نامعتبره. برای وضعیت کامل: `{PREFIX}autopost`")
+    await event.edit(f"دستور نامعتبره. برای وضعیت کامل: `{PREFIX}ارسال‌خودکار`")
 
 
 async def autopost_worker():
@@ -1428,96 +1492,219 @@ async def autopost_worker():
             for chat_id_str in list(autopost_state["chats"].keys()):
                 try:
                     await client.send_message(int(chat_id_str), autopost_state["text"])
+                    STATS["autopost_ok"] += 1
                 except errors.FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
                     print(f"خطا در ارسال خودکار به {chat_id_str}:", e)
+                    STATS["autopost_fail"] += 1
+                    _record_error()
             _reset_autopost_timer()
+            save_stats()
 
 
 # ---------------------------------------------------------------------------
-# ۱۱) راهنما
+# ۱۱) آمار سلف‌بات
+# ---------------------------------------------------------------------------
+
+@client.on(events.NewMessage())
+async def stats_collector(event):
+    """
+    یه هندلر عمومیِ کم‌هزینه که روی *هر* پیامی (ورودی یا خروجی، دستور یا معمولی)
+    اجرا می‌شه تا آمار کلی رو جمع کنه - بدون نیاز به دست‌کاری تک‌تک هندلرهای
+    بالا. تشخیص «دستور واقعی» با چک‌کردن اولین کلمه‌ی بعد از پیشوند در
+    ALL_COMMAND_NAMES انجام می‌شه (همون دیکشنری‌ای که pat() موقع ثبت هر
+    دستور پر می‌کنه)، پس تایپ‌های اشتباه با پیشوند به‌اشتباه به‌عنوان دستورِ
+    اجراشده شمرده نمی‌شن.
+    """
+    _record_message(event)
+    if event.out and event.raw_text and event.raw_text.startswith(PREFIX):
+        rest = event.raw_text[len(PREFIX):]
+        first_word = rest.split(None, 1)[0] if rest.strip() else ""
+        if first_word:
+            _record_command(event, first_word)
+
+
+def _format_uptime():
+    return str(timedelta(seconds=int(time.time() - START_TIME)))
+
+
+def _stats_summary_text():
+    top_commands = sorted(STATS["commands_by_name"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+    if top_commands:
+        cmd_lines = "\n".join(f"   {i+1}. `{name}` — {n} بار" for i, (name, n) in enumerate(top_commands))
+    else:
+        cmd_lines = "   (هنوز دستوری اجرا نشده)"
+
+    per_chat = STATS["per_chat"]
+    top_chats = sorted(per_chat.items(), key=lambda kv: kv[1]["messages"] + kv[1]["commands"], reverse=True)[:5]
+    if top_chats:
+        chat_lines = "\n".join(
+            f"   – {info.get('title') or cid}: {info['messages']} پیام، {info['commands']} دستور"
+            for cid, info in top_chats
+        )
+    else:
+        chat_lines = "   (هنوز پیامی ثبت نشده)"
+
+    return (
+        "📊 **آمار سلف‌بات**\n\n"
+        f"⏳ زمان فعالیت: `{_format_uptime()}`\n"
+        f"⚙️ دستورات اجراشده: **{STATS['commands_total']}**\n"
+        f"✉️ پیام‌های پردازش‌شده: **{STATS['messages_total']}**\n"
+        f"🔁 ارسال‌خودکار موفق/ناموفق: **{STATS['autopost_ok']}** / **{STATS['autopost_fail']}**\n"
+        f"❌ خطاهای سیستمی: **{STATS['errors']}**\n\n"
+        f"🏆 پراستفاده‌ترین دستورها:\n{cmd_lines}\n\n"
+        f"💬 فعال‌ترین چت‌ها:\n{chat_lines}\n\n"
+        f"جزئیات کامل هر چت: `{PREFIX}آمار چت‌ها`\n"
+        f"پاک‌کردن و شروع دوباره‌ی شمارش: `{PREFIX}آمار بازنشانی`"
+    )
+
+
+async def _stats_chats_text():
+    per_chat = STATS["per_chat"]
+    if not per_chat:
+        return "هنوز آماری برای هیچ چتی ثبت نشده"
+    ordered = sorted(per_chat.items(), key=lambda kv: kv[1]["messages"] + kv[1]["commands"], reverse=True)
+    lines = ["💬 **آمار به‌تفکیک چت:**\n"]
+    for cid, info in ordered[:20]:
+        title = info.get("title")
+        if not title:
+            try:
+                chat = await client.get_entity(int(cid))
+                title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or cid
+                info["title"] = title
+            except Exception:
+                title = cid
+        lines.append(f"▫️ **{title}** — {info['messages']} پیام، {info['commands']} دستور")
+    if len(ordered) > 20:
+        lines.append(f"\n… و {len(ordered) - 20} چت دیگر")
+    return "\n".join(lines)
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["آمار", "stats"])))
+async def stats_handler(event):
+    raw = (event.pattern_match.group(1) or "").strip().lower()
+    sub = raw.split(maxsplit=1)[0] if raw else ""
+
+    if not sub:
+        save_stats()
+        return await event.edit(_stats_summary_text())
+
+    if sub in ("چت‌ها", "چتها", "chats"):
+        return await event.edit(await _stats_chats_text())
+
+    if sub in ("بازنشانی", "ریست", "reset"):
+        STATS.update({
+            "commands_total": 0,
+            "commands_by_name": {},
+            "messages_total": 0,
+            "autopost_ok": 0,
+            "autopost_fail": 0,
+            "errors": 0,
+            "per_chat": {},
+        })
+        save_stats()
+        return await event.edit("🗑 آمار پاک شد و شمارش از نو شروع شد")
+
+    await event.edit(f"دستور نامعتبره. برای دیدن آمار: `{PREFIX}آمار`")
+
+
+async def stats_saver():
+    """هر چند ثانیه یک‌بار آمار رو روی دیسک ذخیره می‌کنه تا با ری‌استارت/ری‌دیپلوی از دست نره."""
+    while True:
+        await asyncio.sleep(STATS_SAVE_INTERVAL)
+        save_stats()
+
+
+# ---------------------------------------------------------------------------
+# ۱۲) راهنما
 # ---------------------------------------------------------------------------
 
 def build_help_text():
     return f"""📋 **لیست دستورات سلف‌بات** (پیشوند: `{PREFIX}`)
+ℹ️ نام‌های انگلیسیِ قدیمی (مثل `{PREFIX}ping`, `{PREFIX}help`) هم برای سازگاری هنوز کار می‌کنن.
 
 **عمومی**
-{PREFIX}ping — تست پینگ
-{PREFIX}alive — وضعیت بات
-{PREFIX}id — آیدی چت/کاربر/پیام
-{PREFIX}info — اطلاعات کاربر (ریپلای اختیاری)
+{PREFIX}پینگ — تست پینگ
+{PREFIX}فعال — وضعیت بات
+{PREFIX}آیدی — آیدی چت/کاربر/پیام
+{PREFIX}اطلاعات — اطلاعات کاربر (ریپلای اختیاری)
 
 **ابزار**
-{PREFIX}calc <عبارت> — ماشین‌حساب
-{PREFIX}qr <متن> — ساخت کیو‌آر کد
-{PREFIX}shorten <لینک> — کوتاه‌کردن لینک
-{PREFIX}weather <شهر> — آب‌وهوا
-{PREFIX}tr <زبان> <متن> — ترجمه
-{PREFIX}google <عبارت> — جستجوی گوگل
+{PREFIX}حساب <عبارت> — ماشین‌حساب
+{PREFIX}کیوآر <متن> — ساخت کیو‌آر کد
+{PREFIX}کوتاه <لینک> — کوتاه‌کردن لینک
+{PREFIX}هوا <شهر> — آب‌وهوا
+{PREFIX}ترجمه <زبان> <متن> — ترجمه
+{PREFIX}جستجو <عبارت> — جستجوی گوگل
 
 **یادداشت**
-{PREFIX}note <کلید> <متن> — ذخیره یادداشت
-{PREFIX}notes — لیست یادداشت‌ها
-{PREFIX}getnote <کلید> — نمایش یادداشت
-{PREFIX}delnote <کلید> — حذف یادداشت
+{PREFIX}یادداشت <کلید> <متن> — ذخیره یادداشت
+{PREFIX}یادداشت‌ها — لیست یادداشت‌ها
+{PREFIX}نمایش‌یادداشت <کلید> — نمایش یادداشت
+{PREFIX}حذف‌یادداشت <کلید> — حذف یادداشت
 
 **مدیریت پیام**
-{PREFIX}del — حذف پیام ریپلای‌شده
-{PREFIX}purge <عدد> — حذف چند پیام آخر (یا ریپلای)
-{PREFIX}pin / {PREFIX}unpin — پین/آنپین پیام ریپلای‌شده
+{PREFIX}حذف — حذف پیام ریپلای‌شده
+{PREFIX}پاکسازی <عدد> — حذف چند پیام آخر (یا ریپلای)
+{PREFIX}سنجاق / {PREFIX}برداشتن‌سنجاق — پین/آنپین پیام ریپلای‌شده
 
 **سرگرمی**
-{PREFIX}write <متن> — افکت تایپ زنده
-{PREFIX}type <متن> — شبیه‌سازی تایپ قبل از ارسال
-{PREFIX}reverse <متن> — معکوس کردن متن
-{PREFIX}mock <متن> — mOcKiNg CaSe
+{PREFIX}تایپ‌زنده <متن> — افکت تایپ زنده
+{PREFIX}پیش‌تایپ <متن> — شبیه‌سازی تایپ قبل از ارسال
+{PREFIX}معکوس <متن> — معکوس کردن متن
+{PREFIX}طنز <متن> — تبدیل به حروف بزرگ‌وکوچکِ متناوب (طنزآمیز)
 {PREFIX}تاس <۱ تا ۶> — انداختن تاس واقعی تا رسیدن به همون عدد
-{PREFIX}font list — لیست فونت‌های موجود (انگلیسی/فارسی/ترکیبی)
-{PREFIX}font <نام> <متن> — تبدیل یه‌بارِ متن به فونت انتخابی
-{PREFIX}font set <نام> — تنظیم فونت پیش‌فرض برای حالت خودکار
-{PREFIX}font on/off — روشن/خاموش کردن اعمال خودکار فونت روی همه‌ی پیام‌ها
-{PREFIX}font status — وضعیت فونت خودکار
+{PREFIX}قلم فهرست — لیست فونت‌های موجود (انگلیسی/فارسی/ترکیبی)
+{PREFIX}قلم <نام> <متن> — تبدیل یه‌بارِ متن به فونت انتخابی
+{PREFIX}قلم تنظیم <نام> — تنظیم فونت پیش‌فرض برای حالت خودکار
+{PREFIX}قلم روشن/خاموش — روشن/خاموش کردن اعمال خودکار فونت روی همه‌ی پیام‌ها
+{PREFIX}قلم وضعیت — وضعیت فونت خودکار
 
 **پروفایل**
-{PREFIX}setbio <متن> — تغییر بیو
-{PREFIX}setname <متن> — تغییر نام پایه (زیربنای ساعت زنده)
-{PREFIX}setpic — تغییر عکس پروفایل (ریپلای روی عکس)
-{PREFIX}clock on/off — روشن/خاموش‌کردن ساعت زنده در نام
-{PREFIX}clockstyle — لیست استایل‌های ساعت (فونت/شکل)
-{PREFIX}clockstyle <نام>/next — تغییر استایل ساعت
+{PREFIX}بیو <متن> — تغییر بیو
+{PREFIX}نام <متن> — تغییر نام پایه (زیربنای ساعت زنده)
+{PREFIX}عکس — تغییر عکس پروفایل (ریپلای روی عکس)
+{PREFIX}ساعت روشن/خاموش — روشن/خاموش‌کردن ساعت زنده در نام
+{PREFIX}شکل‌ساعت — لیست استایل‌های ساعت (فونت/شکل)
+{PREFIX}شکل‌ساعت <نام>/بعدی — تغییر استایل ساعت
 
 **🤖 منشی چت**
-{PREFIX}assistant on/off — روشن/خاموش کردن دستی (قفل می‌شه، تشخیص خودکار غیرفعال می‌شه)
-{PREFIX}assistant auto — برگشت به تشخیص خودکار آنلاین/آفلاین
-{PREFIX}assistant status — نمایش وضعیت منشی
-{PREFIX}assistant text <متن> — تنظیم پیام پاسخ
-{PREFIX}assistant delay <ثانیه> — تنظیم تأخیر
-{PREFIX}assistant mode <auto/mention/pm/groups> — تعیین حالت پاسخ
-{PREFIX}assistant exclude — عدم پاسخ در چت فعلی
-{PREFIX}assistant include — فعال‌سازی برای چت فعلی
-{PREFIX}assistant clear — حذف لیست چت‌ها
+{PREFIX}منشی روشن/خاموش — روشن/خاموش کردن دستی (قفل می‌شه، تشخیص خودکار غیرفعال می‌شه)
+{PREFIX}منشی خودکار — برگشت به تشخیص خودکار آنلاین/آفلاین
+{PREFIX}منشی وضعیت — نمایش وضعیت منشی
+{PREFIX}منشی متن <متن> — تنظیم پیام پاسخ
+{PREFIX}منشی تأخیر <ثانیه> — تنظیم تأخیر
+{PREFIX}منشی حالت <خودکار/منشن/پیوی/گروه‌ها> — تعیین حالت پاسخ
+{PREFIX}منشی مستثنی — عدم پاسخ در چت فعلی
+{PREFIX}منشی شامل — فعال‌سازی برای چت فعلی
+{PREFIX}منشی پاک — حذف لیست چت‌ها
 
 **مدیریت گروه** (فقط جایی که ادمین هستید)
-{PREFIX}kick / {PREFIX}ban / {PREFIX}promote / {PREFIX}demote — با ریپلای روی کاربر
+{PREFIX}اخراج / {PREFIX}مسدود / {PREFIX}ارتقا / {PREFIX}تنزل — با ریپلای روی کاربر
 
 **دیگر**
-{PREFIX}backup <عدد> — بکاپ از پیام‌های چت به Saved Messages
+{PREFIX}پشتیبان <عدد> — بکاپ از پیام‌های چت به Saved Messages
 
 **ارسال خودکار متن**
-{PREFIX}autopost — نمایش وضعیت کامل
-{PREFIX}autopost on/off — روشن/خاموش
-{PREFIX}autopost interval <دقیقه> — تنظیم فاصله
-{PREFIX}autopost text <متن> — تنظیم متن (یا ریپلای)
-{PREFIX}autopost add/remove — افزودن/حذف گروه فعلی از مقصدها
-{PREFIX}autopost clear — پاک‌کردن همه‌ی مقصدها
-{PREFIX}autopost now — ارسال فوری (تست)
+{PREFIX}ارسال‌خودکار — نمایش وضعیت کامل
+{PREFIX}ارسال‌خودکار روشن/خاموش — روشن/خاموش
+{PREFIX}ارسال‌خودکار فاصله <دقیقه> — تنظیم فاصله
+{PREFIX}ارسال‌خودکار متن <متن> — تنظیم متن (یا ریپلای)
+{PREFIX}ارسال‌خودکار افزودن/حذف — افزودن/حذف گروه فعلی از مقصدها
+{PREFIX}ارسال‌خودکار پاک — پاک‌کردن همه‌ی مقصدها
+{PREFIX}ارسال‌خودکار فوری — ارسال فوری (تست)
 
-{PREFIX}help — همین راهنما
+**📊 آمار**
+{PREFIX}آمار — نمایش آمار کلی (دستورات، پیام‌ها، ارسال‌خودکار، خطاها، زمان فعالیت)
+{PREFIX}آمار چت‌ها — آمار به‌تفکیک هر چت
+{PREFIX}آمار بازنشانی — پاک‌کردن همه‌ی آمار و شروع دوباره
+
+{PREFIX}راهنما — همین راهنما
 """
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat("help", arg=False)))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["راهنما", "help"], arg=False)))
 async def help_handler(event):
     await event.edit(build_help_text())
 
@@ -1551,6 +1738,7 @@ async def clock_updater():
             except errors.FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
             except Exception as e:
+                _record_error()
                 print("خطا در بروزرسانی ساعت:", e)
         # صبر تا دقیقاً لحظه‌ی شروع دقیقه‌ی بعدی (نه یک فاصله‌ی ثابت و بی‌ربط به ساعت واقعی)
         now2 = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
@@ -1569,6 +1757,7 @@ async def main():
     client.loop.create_task(clock_updater())
     client.loop.create_task(autopost_worker())
     client.loop.create_task(assistant_status_watcher())
+    client.loop.create_task(stats_saver())
     await client.run_until_disconnected()
 
 
