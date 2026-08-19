@@ -588,27 +588,33 @@ async def weather_handler(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["ترجمه", "tr"])))
 async def translate_handler(event):
+    from deep_translator import GoogleTranslator
+
     args = event.pattern_match.group(1)
     lang, text = None, None
+
     if args and " " in args:
         lang, text = args.split(" ", 1)
     elif args and event.is_reply:
         lang = args.strip()
         reply = await event.get_reply_message()
         text = reply.raw_text
+
     if not lang or not text:
-        return await event.edit(f"مثال: `{PREFIX}ترجمه en سلام دنیا` یا با ریپلای: `{PREFIX}ترجمه en`")
+        return await event.edit(
+            f"مثال: `{PREFIX}ترجمه en سلام دنیا` یا با ریپلای: `{PREFIX}ترجمه en`"
+        )
+
     try:
-        session = await get_http_session()
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with session.get("https://api.mymemory.translated.net/get",
-                                params={"q": text, "langpair": f"auto|{lang}"},
-                                timeout=timeout) as r:
-            data = await r.json(content_type=None)
-        translated = data["responseData"]["translatedText"]
+        translated = GoogleTranslator(
+            source="auto",
+            target=lang.lower()
+        ).translate(text)
+
         await event.edit(f"🌐 ترجمه ({lang}):\n{translated}")
-    except Exception:
-        await event.edit("❌ خطا در ترجمه")
+
+    except Exception as e:
+        await event.edit(f"❌ خطا در ترجمه:\n{e}")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["جستجو", "google"])))
