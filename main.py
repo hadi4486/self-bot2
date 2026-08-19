@@ -17,10 +17,13 @@ import re
 import ast
 import json
 import time
+import random
+import hashlib
 import operator
 import asyncio
-import requests
+import aiohttp
 from io import BytesIO
+from urllib.parse import quote as urlquote
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -53,6 +56,15 @@ else:
 
 START_TIME = time.time()
 SELF_ID = None  # توی main() موقع اتصال پر می‌شه - برای جلوگیری از فراخوانی مکرر get_me()
+
+HTTP_SESSION: aiohttp.ClientSession | None = None  # توی main() ساخته می‌شه، برای همه‌ی درخواست‌های HTTP مشترکه
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """یک aiohttp.ClientSession مشترک برمی‌گردونه (اگه هنوز ساخته نشده، می‌سازدش)."""
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        HTTP_SESSION = aiohttp.ClientSession()
+    return HTTP_SESSION
 def load_assistant():
     default = {
         "mode": "mention",
@@ -469,9 +481,13 @@ async def shorten_handler(event):
     if not url:
         return await event.edit(f"مثال: `{PREFIX}کوتاه https://example.com/long-link`")
     try:
-        r = requests.get("https://is.gd/create.php",
-                          params={"format": "simple", "url": url}, timeout=10)
-        await event.edit(f"🔗 لینک کوتاه‌شده:\n{r.text}")
+        session = await get_http_session()
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get("https://is.gd/create.php",
+                                params={"format": "simple", "url": url},
+                                timeout=timeout) as r:
+            text = await r.text()
+        await event.edit(f"🔗 لینک کوتاه‌شده:\n{text}")
     except Exception:
         await event.edit("❌ خطا در کوتاه کردن لینک")
 
@@ -482,8 +498,12 @@ async def weather_handler(event):
     if not city:
         return await event.edit(f"مثال: `{PREFIX}هوا Tehran`")
     try:
-        r = requests.get(f"https://wttr.in/{city}?format=%C+%t+%h+%w", timeout=10)
-        await event.edit(f"🌤 آب‌وهوای {city}:\n{r.text}")
+        session = await get_http_session()
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get(f"https://wttr.in/{city}?format=%C+%t+%h+%w",
+                                timeout=timeout) as r:
+            text = await r.text()
+        await event.edit(f"🌤 آب‌وهوای {city}:\n{text}")
     except Exception:
         await event.edit("❌ خطا در دریافت آب‌وهوا")
 
@@ -501,9 +521,13 @@ async def translate_handler(event):
     if not lang or not text:
         return await event.edit(f"مثال: `{PREFIX}ترجمه en سلام دنیا` یا با ریپلای: `{PREFIX}ترجمه en`")
     try:
-        r = requests.get("https://api.mymemory.translated.net/get",
-                          params={"q": text, "langpair": f"auto|{lang}"}, timeout=10)
-        translated = r.json()["responseData"]["translatedText"]
+        session = await get_http_session()
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get("https://api.mymemory.translated.net/get",
+                                params={"q": text, "langpair": f"auto|{lang}"},
+                                timeout=timeout) as r:
+            data = await r.json(content_type=None)
+        translated = data["responseData"]["translatedText"]
         await event.edit(f"🌐 ترجمه ({lang}):\n{translated}")
     except Exception:
         await event.edit("❌ خطا در ترجمه")
@@ -514,7 +538,7 @@ async def google_handler(event):
     q = event.pattern_match.group(1)
     if not q:
         return await event.edit(f"مثال: `{PREFIX}جستجو چطور پایتون یاد بگیرم`")
-    link = "https://www.google.com/search?q=" + requests.utils.quote(q)
+    link = "https://www.google.com/search?q=" + urlquote(q)
     await event.edit(f"🔍 نتایج گوگل برای: {q}\n{link}")
 
 
@@ -613,7 +637,8 @@ async def unpin_handler(event):
 
 
 # ---------------------------------------------------------------------------
-# ۵) سرگرمی: write / type / reverse / mock
+# ۵) سرگرمی: write / type / reverse / mock / dice / coin / random / choose / rps /
+#    guess / slot / 8ball / love / wyr
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["تایپ‌زنده", "write"])))
@@ -719,7 +744,199 @@ async def dice_handler(event):
     )
 
 
-# --- فونت پیام: انگلیسی (یونیکد ریاضی) / فارسی (تزئینی) / ترکیبی ---
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["شیرخط", "coin"], arg=False)))
+async def coin_handler(event):
+    result = random.choice(["🦁 شیر", "✍️ خط"])
+    await event.edit(f"🪙 {result}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["تصادفی", "random"])))
+async def random_handler(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    nums = arg.split()
+    if len(nums) != 2 or not all(n.lstrip("-").isdigit() for n in nums):
+        return await event.edit(f"مثال: `{PREFIX}تصادفی 1 100`")
+    lo, hi = int(nums[0]), int(nums[1])
+    if lo > hi:
+        lo, hi = hi, lo
+    await event.edit(f"🎯 عدد تصادفی: **{random.randint(lo, hi)}**")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["انتخاب", "choose"])))
+async def choose_handler(event):
+    arg = event.pattern_match.group(1)
+    if not arg:
+        return await event.edit(f"مثال: `{PREFIX}انتخاب پیتزا, برگر, سوشی`")
+    options = [o.strip() for o in re.split(r",|\|", arg) if o.strip()]
+    if len(options) < 2:
+        options = [o.strip() for o in arg.split() if o.strip()]
+    if len(options) < 2:
+        return await event.edit("حداقل ۲ گزینه لازمه (با کاما یا فاصله جداشون کن)")
+    await event.edit(f"🎲 انتخاب شد: **{random.choice(options)}**")
+
+
+_RPS_CHOICES = {
+    "سنگ": "🪨", "rock": "🪨",
+    "کاغذ": "📄", "paper": "📄",
+    "قیچی": "✂️", "scissors": "✂️",
+}
+_RPS_CANONICAL = {"سنگ": "سنگ", "rock": "سنگ", "کاغذ": "کاغذ", "paper": "کاغذ", "قیچی": "قیچی", "scissors": "قیچی"}
+_RPS_BEATS = {"سنگ": "قیچی", "قیچی": "کاغذ", "کاغذ": "سنگ"}
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["سنگ‌کاغذقیچی", "rps"])))
+async def rps_handler(event):
+    arg = (event.pattern_match.group(1) or "").strip().lower()
+    if arg not in _RPS_CANONICAL:
+        return await event.edit(f"مثال: `{PREFIX}سنگ‌کاغذقیچی سنگ` (یا کاغذ/قیچی)")
+    user_choice = _RPS_CANONICAL[arg]
+    bot_choice = random.choice(["سنگ", "کاغذ", "قیچی"])
+    if user_choice == bot_choice:
+        result = "🤝 مساوی شد!"
+    elif _RPS_BEATS[user_choice] == bot_choice:
+        result = "🎉 بردی!"
+    else:
+        result = "😅 باختی!"
+    await event.edit(
+        f"شما: {_RPS_CHOICES[user_choice]} {user_choice}\n"
+        f"من: {_RPS_CHOICES[bot_choice]} {bot_choice}\n\n"
+        f"{result}"
+    )
+
+
+GUESS_GAMES = {}  # chat_id -> {"target": int, "max": int, "attempts": int} - بازیِ فعالِ هر چت
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["حدس", "guess"])))
+async def guess_handler(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    chat_id = event.chat_id
+    parts = arg.split()
+    sub = parts[0].lower() if parts else ""
+
+    if not arg or sub in ("شروع", "start"):
+        max_n = 100
+        if len(parts) > 1 and parts[1].isdigit():
+            max_n = max(10, min(int(parts[1]), 1_000_000))
+        GUESS_GAMES[chat_id] = {"target": random.randint(1, max_n), "max": max_n, "attempts": 0}
+        return await event.edit(
+            f"🎯 یه عدد بین ۱ تا {max_n} توی ذهنم انتخاب کردم.\n"
+            f"حدس بزن: `{PREFIX}حدس <عدد>` — برای لغو: `{PREFIX}حدس لغو`"
+        )
+
+    if sub in ("لغو", "cancel", "stop"):
+        if GUESS_GAMES.pop(chat_id, None) is not None:
+            return await event.edit("🚫 بازی لغو شد")
+        return await event.edit("بازی‌ای در حال اجرا نیست")
+
+    if not arg.lstrip("-").isdigit():
+        return await event.edit(f"مثال: اول `{PREFIX}حدس شروع` بعد `{PREFIX}حدس 50`")
+
+    game = GUESS_GAMES.get(chat_id)
+    if not game:
+        return await event.edit(f"بازی‌ای شروع نشده. اول بزن: `{PREFIX}حدس شروع`")
+
+    guess = int(arg)
+    game["attempts"] += 1
+    if guess == game["target"]:
+        attempts = game["attempts"]
+        del GUESS_GAMES[chat_id]
+        return await event.edit(f"🎉 درست حدس زدی! عدد **{guess}** بود (با {attempts} تلاش)")
+    if not (1 <= guess <= game["max"]):
+        game["attempts"] -= 1  # حدسِ خارج از بازه، به‌عنوان تلاش واقعی حساب نشه
+        return await event.edit(f"عدد باید بین ۱ تا {game['max']} باشه")
+    hint = "بالاتر برو 🔼" if guess < game["target"] else "پایین‌تر بیا 🔽"
+    await event.edit(f"❌ نه. {hint} (تلاش شماره {game['attempts']})")
+
+
+_SLOT_EMOJIS = ["🍒", "🍋", "🍇", "🍉", "⭐", "7️⃣", "🔔"]
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["اسلات", "slot"], arg=False)))
+async def slot_handler(event):
+    reels = [random.choice(_SLOT_EMOJIS) for _ in range(3)]
+    result = " | ".join(reels)
+    if reels[0] == reels[1] == reels[2]:
+        msg = "🎉 جکپات! هر سه یکی شدن!"
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        msg = "✨ دوتاش یکی شدن، یه‌کم شانس آوردی!"
+    else:
+        msg = "😅 این دفعه نه، شانس بعدی!"
+    await event.edit(f"🎰 [ {result} ]\n{msg}")
+
+
+_MAGIC8BALL_ANSWERS = [
+    "بله، مطمئنم ✅", "به احتمال زیاد آره", "علائم می‌گن بله",
+    "آره، ولی شک نکن که باید تلاش هم بکنی", "قطعاً همینطوره",
+    "بعیده", "من که بهش شک دارم", "نه، فکر نکنم", "قطعاً نه ❌",
+    "الان نمی‌تونم بگم، دوباره بپرس 🌀", "روی این حساب نکن",
+    "آینده مبهمه، بعداً بپرس", "تمرکز کن و دوباره بپرس",
+]
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["جادوگر", "8ball"])))
+async def magic8ball_handler(event):
+    q = event.pattern_match.group(1)
+    if not q and event.is_reply:
+        reply = await event.get_reply_message()
+        q = reply.raw_text
+    if not q:
+        return await event.edit(f"مثال: `{PREFIX}جادوگر فردا هوا خوبه؟`")
+    answer = random.choice(_MAGIC8BALL_ANSWERS)
+    await event.edit(f"🔮 سوال: {q}\nپاسخ جادوگر: **{answer}**")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["عشق‌سنج", "love"])))
+async def love_calc_handler(event):
+    arg = event.pattern_match.group(1)
+    if not arg:
+        return await event.edit(f"مثال: `{PREFIX}عشق‌سنج علی و سارا`")
+    names = re.split(r"\s+و\s+|\s*[+&]\s*", arg, maxsplit=1)
+    if len(names) != 2 or not all(n.strip() for n in names):
+        words = arg.split()
+        if len(words) < 2:
+            return await event.edit(f"مثال: `{PREFIX}عشق‌سنج علی و سارا`")
+        names = [words[0], " ".join(words[1:])]
+    a, b = names[0].strip(), names[1].strip()
+    # نتیجه بر اساس هش دو اسم محاسبه می‌شه، پس برای یه جفتِ ثابت همیشه یکسانه
+    key = "|".join(sorted([a.lower(), b.lower()]))
+    percent = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16) % 101
+    if percent >= 80:
+        note = "عالیه! 💞"
+    elif percent >= 50:
+        note = "بدک نیست 🙂"
+    elif percent >= 20:
+        note = "یه‌کم ضعیفه 😅"
+    else:
+        note = "شاید دوستیِ ساده بهتر باشه 😬"
+    filled = percent // 10
+    bar = "❤️" * filled + "🤍" * (10 - filled)
+    await event.edit(f"💘 {a} + {b}\n{bar}\n**{percent}%** — {note}")
+
+
+_WYR_PROMPTS = [
+    ("همیشه یک ساعت زودتر همه‌جا برسی", "همیشه یک ساعت دیرتر همه‌جا برسی"),
+    ("بتونی پرواز کنی", "بتونی نامرئی بشی"),
+    ("همیشه گرمت باشه", "همیشه سردت باشه"),
+    ("پول زیاد ولی وقت کم داشته باشی", "وقت زیاد ولی پول کم داشته باشی"),
+    ("هر روز پیتزا بخوری", "هر روز سوشی بخوری"),
+    ("بتونی گذشته رو ببینی", "بتونی آینده رو ببینی"),
+    ("توی جنگل زندگی کنی", "توی وسط شهر شلوغ زندگی کنی"),
+    ("همیشه حقیقت رو بشنوی، حتی تلخ", "همیشه چیزی که دوست داری رو بشنوی"),
+    ("بتونی ذهن بقیه رو بخونی", "بتونی هر زبونی رو بلد باشی"),
+    ("هیچ‌وقت خسته نشی", "هیچ‌وقت گرسنه نشی"),
+]
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["این‌یا‌اون", "wyr"], arg=False)))
+async def wyr_handler(event):
+    a, b = random.choice(_WYR_PROMPTS)
+    await event.edit(f"🤔 **این یا اون؟**\n\n1️⃣ {a}\n\nیا\n\n2️⃣ {b}")
+
+
+# ---------------------------------------------------------------------------
+# ۶) فونت پیام: انگلیسی (یونیکد ریاضی) / فارسی (تزئینی) / ترکیبی
+# ---------------------------------------------------------------------------
 
 def _build_latin_map(upper_start, lower_start, digit_start=None, exceptions=None):
     """
@@ -973,7 +1190,7 @@ async def font_autoapply(event):
 
 
 # ---------------------------------------------------------------------------
-# ۶) پروفایل: setbio / setname / setpic / clock
+# ۷) پروفایل: setbio / setname / setpic / clock
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["بیو", "setbio"])))
@@ -1082,7 +1299,7 @@ async def clockstyle_handler(event):
 
 
 # ---------------------------------------------------------------------------
-# ۷) منشی چت: پاسخ خودکار هوشمند با تشخیص آنلاین/آفلاین
+# ۸) منشی چت: پاسخ خودکار هوشمند با تشخیص آنلاین/آفلاین
 # ---------------------------------------------------------------------------
 
 _ASSISTANT_MODE_FA = {
@@ -1294,7 +1511,7 @@ async def assistant_status_watcher():
 
 
 # ---------------------------------------------------------------------------
-# ۸) مدیریت گروه: kick / ban / promote / demote (فقط جایی که ادمین هستید)
+# ۹) مدیریت گروه: kick / ban / promote / demote (فقط جایی که ادمین هستید)
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["اخراج", "kick"], arg=False)))
@@ -1351,31 +1568,206 @@ async def demote_handler(event):
 
 
 # ---------------------------------------------------------------------------
-# ۹) بکاپ گرفتن از پیام‌های یک چت
+# ۱۰) بکاپ‌گیری: پیام‌ها (متن/JSON)، رسانه‌ها، لیست چت‌ها، و کل تنظیمات بات
 # ---------------------------------------------------------------------------
+
+BACKUP_MAX_MESSAGES = 2000   # سقف تعداد پیام قابل‌بررسی در یک بکاپ (جلوگیری از فلود/تایم‌اوت)
+BACKUP_MAX_MEDIA = 50        # سقف تعداد فایل رسانه‌ در یک بکاپ رسانه (برای رعایت محدودیت‌های تلگرام)
+
+
+def _gather_config_snapshot():
+    """همه‌ی تنظیمات/وضعیتِ ذخیره‌شدنیِ بات رو توی یک دیکشنری واحد جمع می‌کنه."""
+    return {
+        "_kind": "selfbot_config_backup",
+        "_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "notes": load_notes(),
+        "autopost": autopost_state,
+        "assistant": {
+            "mode": assistant_state["mode"],
+            "text": assistant_state["text"],
+            "delay": assistant_state["delay"],
+            "include": list(assistant_state["include"]),
+            "exclude": list(assistant_state["exclude"]),
+            "auto_detect": assistant_state["auto_detect"],
+            "manual_enabled": assistant_state["enabled"] if not assistant_state["auto_detect"] else False,
+        },
+        "font": font_state,
+        "clock": {"enabled": clock_state["enabled"], "style": clock_state["style"]},
+        "stats": STATS,
+    }
+
+
+def _apply_config_snapshot(data):
+    """
+    یه اسنپ‌شات (خروجیِ _gather_config_snapshot) رو روی وضعیت زنده‌ی بات اعمال
+    می‌کنه و فایل‌های مربوطه رو هم روی دیسک به‌روز می‌کنه. کلیدهایی که توی فایل
+    بکاپ نباشن دست‌نخورده می‌مونن (merge، نه جایگزینیِ کامل).
+    """
+    applied = []
+
+    if isinstance(data.get("notes"), dict):
+        save_notes(data["notes"])
+        applied.append("یادداشت‌ها")
+
+    if isinstance(data.get("autopost"), dict):
+        autopost_state.update(data["autopost"])
+        save_autopost()
+        applied.append("ارسال‌خودکار")
+
+    if isinstance(data.get("assistant"), dict):
+        a = data["assistant"]
+        assistant_state["mode"] = a.get("mode", assistant_state["mode"])
+        assistant_state["text"] = a.get("text", assistant_state["text"])
+        assistant_state["delay"] = a.get("delay", assistant_state["delay"])
+        assistant_state["include"] = set(a.get("include", []))
+        assistant_state["exclude"] = set(a.get("exclude", []))
+        assistant_state["auto_detect"] = a.get("auto_detect", assistant_state["auto_detect"])
+        if not assistant_state["auto_detect"]:
+            assistant_state["enabled"] = a.get("manual_enabled", False)
+        save_assistant()
+        applied.append("منشی")
+
+    if isinstance(data.get("font"), dict):
+        font_state.update(data["font"])
+        save_font_state()
+        applied.append("فونت")
+
+    if isinstance(data.get("clock"), dict):
+        if "enabled" in data["clock"]:
+            clock_state["enabled"] = bool(data["clock"]["enabled"])
+        if data["clock"].get("style") in CLOCK_STYLES:
+            clock_state["style"] = data["clock"]["style"]
+        applied.append("ساعت")
+
+    return applied
+
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["پشتیبان", "backup"])))
 async def backup_handler(event):
-    n_str = event.pattern_match.group(1)
+    args = (event.pattern_match.group(1) or "").strip()
+    parts = args.split(None, 1)
+    sub = parts[0].lower() if parts else ""
+
+    # ---- .پشتیبان تنظیمات : بکاپ کامل تنظیمات/وضعیتِ بات (برای بازگردانی بعد از ری‌دیپلوی) ----
+    if sub in ("تنظیمات", "settings", "config"):
+        await event.edit("⏳ در حال آماده‌سازی بکاپ تنظیمات...")
+        snapshot = _gather_config_snapshot()
+        content = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        bio = BytesIO(content.encode("utf-8"))
+        bio.name = f"selfbot_config_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        await client.send_file(
+            "me", bio,
+            caption="⚙️ بکاپ تنظیمات سلف‌بات (یادداشت‌ها، منشی، ارسال‌خودکار، فونت، ساعت، آمار)\n"
+                    f"برای بازیابی: روی همین فایل ریپلای کن و بنویس `{PREFIX}بازیابی`",
+        )
+        return await event.edit("✅ بکاپ تنظیمات به Saved Messages ارسال شد")
+
+    # ---- .پشتیبان چت‌ها : بکاپ لیست همه‌ی چت‌ها/دیالوگ‌های اکانت ----
+    if sub in ("چت‌ها", "چتها", "chats", "dialogs"):
+        await event.edit("⏳ در حال جمع‌آوری لیست چت‌ها...")
+        lines = []
+        async for d in client.iter_dialogs():
+            kind = "کانال" if (d.is_channel and not d.is_group) else ("گروه" if d.is_group else "خصوصی")
+            extra = f" — {d.unread_count} خوانده‌نشده" if d.unread_count else ""
+            lines.append(f"[{kind}] {d.name} — id={d.id}{extra}")
+        content = "\n".join(lines) or "(چتی پیدا نشد)"
+        bio = BytesIO(content.encode("utf-8"))
+        bio.name = "chats_backup.txt"
+        await client.send_file("me", bio, caption=f"📇 بکاپ لیست {len(lines)} چت")
+        return await event.edit("✅ بکاپ لیست چت‌ها به Saved Messages ارسال شد")
+
+    # ---- .پشتیبان رسانه <عدد> : دانلود و فوروارد رسانه‌های N پیام آخر به Saved Messages ----
+    if sub in ("رسانه", "media"):
+        n_str = parts[1].strip() if len(parts) > 1 else ""
+        n = int(n_str) if n_str.isdigit() else 200
+        n = min(n, BACKUP_MAX_MESSAGES)
+        await event.edit(f"⏳ در حال بررسی {n} پیام آخر برای رسانه...")
+        sent = 0
+        hit_cap = False
+        async for m in client.iter_messages(event.chat_id, limit=n):
+            if not m.media:
+                continue
+            if sent >= BACKUP_MAX_MEDIA:
+                hit_cap = True
+                break
+            try:
+                date = m.date.strftime("%Y-%m-%d %H:%M")
+                await client.send_file("me", m.media, caption=f"🗂 از چت {event.chat_id} — {date}")
+                sent += 1
+            except Exception as e:
+                _record_error()
+                print("خطا در بکاپ رسانه:", e)
+        note = f" (به سقف {BACKUP_MAX_MEDIA} فایل رسیدیم، بقیه ارسال نشدن)" if hit_cap else ""
+        return await event.edit(f"✅ {sent} فایل رسانه به Saved Messages ارسال شد{note}")
+
+    # ---- .پشتیبان json <عدد> : بکاپ ساختاریافته‌ی پیام‌ها (برای پردازش برنامه‌ای) ----
+    as_json = sub in ("json", "جیسون")
+    n_str = (parts[1].strip() if len(parts) > 1 else "") if as_json else args
     n = int(n_str) if n_str and n_str.isdigit() else 100
-    n = min(n, 1000)
+    n = min(n, BACKUP_MAX_MESSAGES)
     await event.edit(f"⏳ در حال گرفتن بکاپ {n} پیام آخر...")
-    lines = []
-    async for m in client.iter_messages(event.chat_id, limit=n):
-        sender = await m.get_sender()
-        name = getattr(sender, "first_name", "؟") if sender else "؟"
-        date = m.date.strftime("%Y-%m-%d %H:%M")
-        lines.append(f"[{date}] {name}: {m.raw_text or '(media)'}")
-    lines.reverse()
-    content = "\n".join(lines) or "(چتی برای بکاپ پیدا نشد)"
-    bio = BytesIO(content.encode("utf-8"))
-    bio.name = "backup.txt"
+
+    if as_json:
+        items = []
+        async for m in client.iter_messages(event.chat_id, limit=n):
+            sender = await m.get_sender()
+            name = getattr(sender, "first_name", None) if sender else None
+            items.append({
+                "id": m.id,
+                "date": m.date.isoformat(),
+                "sender_id": m.sender_id,
+                "sender_name": name,
+                "text": m.raw_text or None,
+                "media_type": type(m.media).__name__ if m.media else None,
+            })
+        items.reverse()
+        content = json.dumps(items, ensure_ascii=False, indent=2)
+        bio = BytesIO(content.encode("utf-8"))
+        bio.name = "backup.json"
+    else:
+        lines = []
+        async for m in client.iter_messages(event.chat_id, limit=n):
+            sender = await m.get_sender()
+            name = getattr(sender, "first_name", "؟") if sender else "؟"
+            date = m.date.strftime("%Y-%m-%d %H:%M")
+            lines.append(f"[{date}] {name}: {m.raw_text or '(media)'}")
+        lines.reverse()
+        content = "\n".join(lines) or "(چتی برای بکاپ پیدا نشد)"
+        bio = BytesIO(content.encode("utf-8"))
+        bio.name = "backup.txt"
+
     await client.send_file("me", bio, caption=f"📦 بکاپ {n} پیام از چت {event.chat_id}")
     await event.edit("✅ بکاپ به Saved Messages ارسال شد")
 
 
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["بازیابی", "restore"], arg=False)))
+async def restore_handler(event):
+    """با ریپلای روی فایلِ خروجیِ `.پشتیبان تنظیمات`، تنظیمات بات رو برمی‌گردونه."""
+    if not event.is_reply:
+        return await event.edit(f"روی فایل بکاپِ تنظیمات (خروجیِ `{PREFIX}پشتیبان تنظیمات`) ریپلای کن")
+    reply = await event.get_reply_message()
+    if not reply.file:
+        return await event.edit("پیام ریپلای‌شده فایل نداره")
+    await event.edit("⏳ در حال بازیابی تنظیمات...")
+    try:
+        raw = await client.download_media(reply, file=bytes)
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("_kind") != "selfbot_config_backup":
+            return await event.edit("❌ این فایل، بکاپ تنظیماتِ سلف‌بات نیست")
+        applied = _apply_config_snapshot(data)
+        if not applied:
+            return await event.edit("چیزی برای بازیابی توی این فایل پیدا نشد")
+        await event.edit("✅ بازیابی شد: " + "، ".join(applied))
+    except json.JSONDecodeError:
+        await event.edit("❌ فایل معتبر (JSON) نیست")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا در بازیابی: {e}")
+
+
 # ---------------------------------------------------------------------------
-# ۱۰) ارسال خودکار متن به گروه (autopost)
+# ۱۱) ارسال خودکار متن به گروه (autopost)
 # ---------------------------------------------------------------------------
 
 def _autopost_status_text():
@@ -1504,7 +1896,7 @@ async def autopost_worker():
 
 
 # ---------------------------------------------------------------------------
-# ۱۱) آمار سلف‌بات
+# ۱۲) آمار سلف‌بات
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage())
@@ -1617,7 +2009,7 @@ async def stats_saver():
 
 
 # ---------------------------------------------------------------------------
-# ۱۲) راهنما
+# ۱۳) راهنما
 # ---------------------------------------------------------------------------
 
 def build_help_text():
@@ -1655,6 +2047,19 @@ def build_help_text():
 {PREFIX}معکوس <متن> — معکوس کردن متن
 {PREFIX}طنز <متن> — تبدیل به حروف بزرگ‌وکوچکِ متناوب (طنزآمیز)
 {PREFIX}تاس <۱ تا ۶> — انداختن تاس واقعی تا رسیدن به همون عدد
+{PREFIX}شیرخط — شیر یا خط
+{PREFIX}تصادفی <min> <max> — عدد تصادفی بین دو عدد
+{PREFIX}انتخاب <گزینه۱, گزینه۲, ...> — انتخاب تصادفی بین چند گزینه
+{PREFIX}سنگ‌کاغذقیچی <سنگ/کاغذ/قیچی> — بازی سنگ‌کاغذقیچی با بات
+{PREFIX}حدس شروع <سقف اختیاری> — شروع بازیِ حدسِ عدد
+{PREFIX}حدس <عدد> — حدس‌زدن توی بازیِ فعال (راهنمای بالاتر/پایین‌تر می‌ده)
+{PREFIX}حدس لغو — لغو بازیِ فعال
+{PREFIX}اسلات — ماشین اسلات (سه تا نماد تصادفی)
+{PREFIX}جادوگر <سوال> — پاسخ تصادفیِ توپ جادویی (بله/خیر)
+{PREFIX}عشق‌سنج <اسم۱> و <اسم۲> — درصد عشق‌سنجِ شوخی بین دو اسم
+{PREFIX}این‌یا‌اون — یه سوالِ «این یا اون» تصادفی
+
+**فونت پیام**
 {PREFIX}قلم فهرست — لیست فونت‌های موجود (انگلیسی/فارسی/ترکیبی)
 {PREFIX}قلم <نام> <متن> — تبدیل یه‌بارِ متن به فونت انتخابی
 {PREFIX}قلم تنظیم <نام> — تنظیم فونت پیش‌فرض برای حالت خودکار
@@ -1683,8 +2088,13 @@ def build_help_text():
 **مدیریت گروه** (فقط جایی که ادمین هستید)
 {PREFIX}اخراج / {PREFIX}مسدود / {PREFIX}ارتقا / {PREFIX}تنزل — با ریپلای روی کاربر
 
-**دیگر**
-{PREFIX}پشتیبان <عدد> — بکاپ از پیام‌های چت به Saved Messages
+**بکاپ‌گیری**
+{PREFIX}پشتیبان <عدد> — بکاپ متنی از پیام‌های چت به Saved Messages
+{PREFIX}پشتیبان json <عدد> — همون، ولی خروجی JSON ساختاریافته
+{PREFIX}پشتیبان رسانه <عدد> — دانلود/فوروارد رسانه‌های N پیام آخر
+{PREFIX}پشتیبان چت‌ها — بکاپ لیست همه‌ی چت‌ها/دیالوگ‌های اکانت
+{PREFIX}پشتیبان تنظیمات — بکاپ کامل تنظیمات بات (یادداشت، منشی، ارسال‌خودکار، فونت، ساعت، آمار)
+{PREFIX}بازیابی — با ریپلای روی فایل بکاپِ تنظیمات، همه‌چیز رو برمی‌گردونه
 
 **ارسال خودکار متن**
 {PREFIX}ارسال‌خودکار — نمایش وضعیت کامل
@@ -1751,6 +2161,7 @@ async def clock_updater():
 
 async def main():
     global SELF_ID
+    await get_http_session()  # ساخت ClientSession مشترک قبل از شروع کار
     me = await client.get_me()
     SELF_ID = me.id
     print(f"✅ سلف‌بات با اکانت {me.first_name} روشن شد")
@@ -1758,7 +2169,11 @@ async def main():
     client.loop.create_task(autopost_worker())
     client.loop.create_task(assistant_status_watcher())
     client.loop.create_task(stats_saver())
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+            await HTTP_SESSION.close()
 
 
 with client:
