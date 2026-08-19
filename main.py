@@ -17,7 +17,10 @@ import re
 import ast
 import json
 import time
+import math
+import base64
 import random
+import string
 import hashlib
 import operator
 import asyncio
@@ -28,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, functions
-from telethon.tl.types import InputMediaDice
+from telethon.tl.types import InputMediaDice, ChatBannedRights, ChannelParticipantsAdmins
 
 load_dotenv()
 
@@ -247,12 +250,23 @@ def save_notes(notes):
 _OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
     ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
-    ast.USub: operator.neg, ast.FloorDiv: operator.floordiv,
+    ast.USub: operator.neg, ast.UAdd: operator.pos, ast.FloorDiv: operator.floordiv,
 }
+
+# توابع و ثابت‌های ریاضیِ مجاز توی ماشین‌حساب - فقط همین‌ها قابل‌فراخوانی‌ان
+CALC_FUNCS = {
+    "sqrt": math.sqrt, "abs": abs, "round": round,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan,
+    "log": math.log, "log10": math.log10, "log2": math.log2, "exp": math.exp,
+    "floor": math.floor, "ceil": math.ceil, "factorial": math.factorial,
+    "min": min, "max": max, "hypot": math.hypot, "degrees": math.degrees, "radians": math.radians,
+}
+CALC_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 
 
 def safe_eval(expr):
-    """ماشین‌حساب امن - فقط عملیات ریاضی ساده، بدون اجرای کد دلخواه"""
+    """ماشین‌حساب امن - عملیات ریاضی + توابع/ثابت‌های رایج، بدون اجرای کد دلخواه"""
     def _eval(node):
         if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
             return node.value
@@ -260,9 +274,20 @@ def safe_eval(expr):
             return _OPS[type(node.op)](_eval(node.left), _eval(node.right))
         if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
             return _OPS[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.Name) and node.id in CALC_CONSTS:
+            return CALC_CONSTS[node.id]
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in CALC_FUNCS and not node.keywords):
+            args = [_eval(a) for a in node.args]
+            return CALC_FUNCS[node.func.id](*args)
         raise ValueError("عبارت نامعتبر")
     tree = ast.parse(expr, mode="eval")
-    return _eval(tree.body)
+    result = _eval(tree.body)
+    if isinstance(result, float):
+        result = round(result, 10)
+        if result.is_integer() and abs(result) < 1e15:
+            result = int(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +320,16 @@ def _to_circled_digits(s):
     return "".join(circ(c) if c.isdigit() else c for c in s)
 
 
+def _to_bold_digits(s):
+    # Mathematical Bold Digits: U+1D7CE تا U+1D7D7
+    return "".join(chr(0x1D7CE + int(c)) if c.isdigit() else c for c in s)
+
+
+def _to_subscript_digits(s):
+    # Subscript Digits: U+2080 تا U+2089
+    return "".join(chr(0x2080 + int(c)) if c.isdigit() else c for c in s)
+
+
 # آیکون ساعت آنالوگ چرخان بر اساس ساعتِ فعلی (۱۲ تا برای رأس ساعت + ۱۲ تا برای نیم‌ساعت)
 _CLOCK_ON_HOUR = ["🕛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚"]
 _CLOCK_HALF_HOUR = ["🕧", "🕜", "🕝", "🕞", "🕟", "🕠", "🕡", "🕢", "🕣", "🕤", "🕥", "🕦"]
@@ -311,16 +346,22 @@ def _rotating_clock_icon(hour, minute):
 # بوده به‌اشتباه به‌عنوان «نام پایه»ی جدید خونده می‌شه. این تابع، مهم نیست خروجی
 # کدوم‌یک از ۱۰ استایل باشه، پسوند ساعتی رو از انتهای نام (حتی اگه چندلایه و
 # تکرارشده باشه) پاک می‌کنه تا نام پایه‌ی واقعی برگرده.
-_DIGIT_CLASS = r"[0-9\u06F0-\u06F9\uFF10-\uFF19\U0001D7D8-\U0001D7E1\U0001D7F6-\U0001D7FF\u2460-\u2468\u24EA]"
+_DIGIT_CLASS = (
+    r"[0-9\u06F0-\u06F9\uFF10-\uFF19\U0001D7D8-\U0001D7E1\U0001D7F6-\U0001D7FF"
+    r"\u2460-\u2468\u24EA\U0001D7CE-\U0001D7D7\u2080-\u2089]"
+)
 _SEP_CLASS = r"[:\uFF1A]"
 _ICON_CLASS = r"(?:[\U0001F550-\U0001F567]|\u23F1)\uFE0F?"
 
 _CLOCK_SUFFIX_RE = re.compile(
     r"(?:\s*\|\s*)?(?:"
     rf"{_ICON_CLASS}\s*{_DIGIT_CLASS}{{2}}{_SEP_CLASS}{_DIGIT_CLASS}{{2}}"   # default / animated
-    rf"|{_DIGIT_CLASS}{{2}}{_SEP_CLASS}{_DIGIT_CLASS}{{2}}"                  # persian/fullwidth/monospace/doublestruck/circled/minimal
+    rf"|{_DIGIT_CLASS}{{2}}{_SEP_CLASS}{_DIGIT_CLASS}{{2}}"                  # persian/fullwidth/monospace/doublestruck/circled/minimal/bold/subscript
     r"|『[0-9]{2}:[0-9]{2}』"                                                 # brackets
     rf"|{_ICON_CLASS}\s*[0-9]{{2}}•[0-9]{{2}}"                               # dotstyle
+    r"|\[[0-9]{2}:[0-9]{2}\]"                                                # square
+    r"|[0-9]{2}-[0-9]{2}"                                                    # dash
+    r"|✦\s*[0-9]{2}:[0-9]{2}\s*✦"                                           # star
     r")\s*$"
 )
 
@@ -373,10 +414,31 @@ def _style_minimal(hour, minute):
     return f"{hour:02d}:{minute:02d}"
 
 
-# ترتیب نمایش در لیست و چرخش با clockstyle next
+def _style_bold(hour, minute):
+    return _to_bold_digits(f"{hour:02d}:{minute:02d}")
+
+
+def _style_subscript(hour, minute):
+    return _to_subscript_digits(f"{hour:02d}:{minute:02d}")
+
+
+def _style_square(hour, minute):
+    return f"[{hour:02d}:{minute:02d}]"
+
+
+def _style_dash(hour, minute):
+    return f"{hour:02d}-{minute:02d}"
+
+
+def _style_star(hour, minute):
+    return f"✦ {hour:02d}:{minute:02d} ✦"
+
+
+# ترتیب نمایش در لیست و چرخش با مدل‌ساعت next
 CLOCK_STYLE_ORDER = [
     "default", "animated", "persian", "fullwidth",
     "monospace", "doublestruck", "circled", "brackets", "dotstyle", "minimal",
+    "bold", "subscript", "square", "dash", "star",
 ]
 CLOCK_STYLES = {
     "default": _style_default,
@@ -389,6 +451,11 @@ CLOCK_STYLES = {
     "brackets": _style_brackets,
     "dotstyle": _style_dotstyle,
     "minimal": _style_minimal,
+    "bold": _style_bold,
+    "subscript": _style_subscript,
+    "square": _style_square,
+    "dash": _style_dash,
+    "star": _style_star,
 }
 
 _env_clock_style = os.getenv("CLOCK_STYLE", "default")
@@ -452,12 +519,23 @@ async def info_handler(event):
 async def calc_handler(event):
     expr = event.pattern_match.group(1)
     if not expr:
-        return await event.edit(f"مثال: `{PREFIX}حساب 5*(3+2)`")
+        return await event.edit(
+            f"مثال: `{PREFIX}حساب 5*(3+2)` یا `{PREFIX}حساب sqrt(2)+sin(pi/2)`\n"
+            "توابع: sqrt, abs, round, sin, cos, tan, asin, acos, atan, log, log10, log2, "
+            "exp, floor, ceil, factorial, min, max, hypot, degrees, radians\n"
+            "ثابت‌ها: pi, e, tau, inf"
+        )
     try:
         result = safe_eval(expr)
         await event.edit(f"🧮 `{expr}` = **{result}**")
-    except Exception:
+    except ZeroDivisionError:
+        await event.edit("❌ تقسیم بر صفر ممکن نیست")
+    except (SyntaxError, ValueError, TypeError):
         await event.edit("❌ عبارت ریاضی نامعتبره")
+    except OverflowError:
+        await event.edit("❌ عدد نتیجه خیلی بزرگه")
+    except Exception:
+        await event.edit("❌ خطا در محاسبه")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["کیوآر", "qr"])))
@@ -540,6 +618,113 @@ async def google_handler(event):
         return await event.edit(f"مثال: `{PREFIX}جستجو چطور پایتون یاد بگیرم`")
     link = "https://www.google.com/search?q=" + urlquote(q)
     await event.edit(f"🔍 نتایج گوگل برای: {q}\n{link}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["رمزعبور", "genpass"])))
+async def genpass_handler(event):
+    arg = (event.pattern_match.group(1) or "").strip()
+    length = 16
+    if arg:
+        try:
+            length = int(arg)
+        except ValueError:
+            return await event.edit(f"مثال: `{PREFIX}رمزعبور 20`")
+        length = max(4, min(length, 128))
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
+    pwd = "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
+    await event.edit(f"🔐 رمز عبور تصادفی ({length} کاراکتر):\n`{pwd}`")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["هش", "hash"])))
+async def hash_handler(event):
+    args = event.pattern_match.group(1)
+    text = None
+    algo = "sha256"
+    if args:
+        parts = args.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() in ("md5", "sha1", "sha256", "sha512"):
+            algo, text = parts[0].lower(), parts[1]
+        else:
+            text = args
+    if not text and event.is_reply:
+        reply = await event.get_reply_message()
+        text = reply.raw_text
+    if not text:
+        return await event.edit(f"مثال: `{PREFIX}هش سلام` یا `{PREFIX}هش sha512 سلام`")
+    digest = hashlib.new(algo, text.encode("utf-8")).hexdigest()
+    await event.edit(f"🔒 {algo}:\n`{digest}`")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["بیس۶۴", "بیس64", "base64"])))
+async def base64_handler(event):
+    args = event.pattern_match.group(1)
+    sub, text = None, None
+    if args:
+        parts = args.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() in ("انکد", "دیکد", "encode", "decode"):
+            sub, text = parts[0].lower(), parts[1]
+    if not text and event.is_reply:
+        reply = await event.get_reply_message()
+        text = reply.raw_text
+        sub = sub or "encode"
+    if not text:
+        return await event.edit(f"مثال: `{PREFIX}بیس64 انکد سلام` یا `{PREFIX}بیس64 دیکد c2xhbQ==`")
+    try:
+        if sub in ("دیکد", "decode"):
+            result = base64.b64decode(text.encode("utf-8")).decode("utf-8", errors="replace")
+            await event.edit(f"🔓 دیکد شده:\n`{result}`")
+        else:
+            result = base64.b64encode(text.encode("utf-8")).decode("utf-8")
+            await event.edit(f"🔐 انکد شده:\n`{result}`")
+    except Exception:
+        await event.edit("❌ خطا در تبدیل - ورودی معتبر نیست")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["نویسه‌شمار", "count"])))
+async def count_handler(event):
+    text = event.pattern_match.group(1)
+    if not text and event.is_reply:
+        reply = await event.get_reply_message()
+        text = reply.raw_text
+    if not text:
+        return await event.edit(f"مثال: `{PREFIX}نویسه‌شمار یک متن اینجا` یا با ریپلای روی پیام")
+    chars = len(text)
+    chars_no_space = len(text.replace(" ", "").replace("\n", ""))
+    words = len(text.split())
+    lines = len(text.splitlines()) or 1
+    await event.edit(
+        "🔢 **آمار متن:**\n"
+        f"حروف: {chars} (بدون فاصله: {chars_no_space})\n"
+        f"کلمات: {words}\n"
+        f"خط‌ها: {lines}"
+    )
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ارز", "currency"])))
+async def currency_handler(event):
+    args = event.pattern_match.group(1)
+    if not args:
+        return await event.edit(f"مثال: `{PREFIX}ارز 10 USD IRR`")
+    parts = args.split()
+    if len(parts) != 3:
+        return await event.edit(f"مثال: `{PREFIX}ارز 10 USD IRR`")
+    try:
+        amount = float(parts[0])
+    except ValueError:
+        return await event.edit(f"مثال: `{PREFIX}ارز 10 USD IRR`")
+    src, dst = parts[1].upper(), parts[2].upper()
+    try:
+        session = await get_http_session()
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get(f"https://open.er-api.com/v6/latest/{src}", timeout=timeout) as r:
+            data = await r.json(content_type=None)
+        if data.get("result") != "success" or dst not in data.get("rates", {}):
+            return await event.edit("❌ کد ارز نامعتبره یا در دسترس نیست")
+        rate = data["rates"][dst]
+        converted = amount * rate
+        await event.edit(f"💱 {amount:g} {src} = **{converted:,.4f} {dst}**\n(نرخ: 1 {src} = {rate:g} {dst})")
+    except Exception:
+        await event.edit("❌ خطا در دریافت نرخ ارز")
 
 
 # ---------------------------------------------------------------------------
@@ -1271,17 +1456,17 @@ async def _apply_clock_now():
         print("خطا در اعمال فوری استایل ساعت:", e)
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=pat(["شکل‌ساعت", "clockstyle"])))
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["مدل‌ساعت", "شکل‌ساعت", "clockstyle"])))
 async def clockstyle_handler(event):
     arg = (event.pattern_match.group(1) or "").strip().lower()
     if not arg or arg in ("فهرست", "list"):
         now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
-        lines = ["🎨 **استایل‌های ساعت زنده:**\n"]
+        lines = ["🎨 **مدل‌های ساعت زنده:**\n"]
         for name in CLOCK_STYLE_ORDER:
             preview = CLOCK_STYLES[name](now.hour, now.minute)
             marker = "✅" if name == clock_state["style"] else "▫️"
             lines.append(f"{marker} `{name}` → {preview}")
-        lines.append(f"\nبرای تغییر: `{PREFIX}شکل‌ساعت <نام>` یا `{PREFIX}شکل‌ساعت بعدی`")
+        lines.append(f"\nبرای تغییر: `{PREFIX}مدل‌ساعت <نام>` یا `{PREFIX}مدل‌ساعت بعدی`")
         return await event.edit("\n".join(lines))
 
     if arg in ("بعدی", "next"):
@@ -1290,7 +1475,7 @@ async def clockstyle_handler(event):
     elif arg in CLOCK_STYLES:
         new_style = arg
     else:
-        return await event.edit(f"استایل نامعتبره. برای دیدن فهرست: `{PREFIX}شکل‌ساعت فهرست`")
+        return await event.edit(f"استایل نامعتبره. برای دیدن فهرست: `{PREFIX}مدل‌ساعت فهرست`")
 
     clock_state["style"] = new_style
     preview = CLOCK_STYLES[new_style](*(datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).timetuple()[3:5])
@@ -1511,7 +1696,8 @@ async def assistant_status_watcher():
 
 
 # ---------------------------------------------------------------------------
-# ۹) مدیریت گروه: kick / ban / promote / demote (فقط جایی که ادمین هستید)
+# ۹) مدیریت گروه: kick / ban / unban / mute / unmute / promote / demote /
+#    adminlist / grouplink / lockgroup / unlockgroup (فقط جایی که ادمین هستید)
 # ---------------------------------------------------------------------------
 
 @client.on(events.NewMessage(outgoing=True, pattern=pat(["اخراج", "kick"], arg=False)))
@@ -1562,6 +1748,101 @@ async def demote_handler(event):
     try:
         await client.edit_admin(event.chat_id, reply.sender_id, is_admin=False)
         await event.edit("✅ ادمین کاربر حذف شد")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["رفع‌مسدود", "unban"], arg=False)))
+async def unban_handler(event):
+    if not event.is_reply:
+        return await event.edit("روی پیام کاربر ریپلای کن")
+    reply = await event.get_reply_message()
+    try:
+        await client.edit_permissions(event.chat_id, reply.sender_id)
+        await event.edit("✅ کاربر آنبن شد")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["بی‌صدا", "mute"])))
+async def mute_handler(event):
+    if not event.is_reply:
+        return await event.edit("روی پیام کاربر ریپلای کن")
+    reply = await event.get_reply_message()
+    minutes_arg = (event.pattern_match.group(1) or "").strip()
+    until_date = None
+    if minutes_arg:
+        try:
+            until_date = datetime.now(timezone.utc) + timedelta(minutes=int(minutes_arg))
+        except ValueError:
+            return await event.edit(f"مثال: `{PREFIX}بی‌صدا 30` (دقیقه) با ریپلای، یا بدون عدد برای همیشه")
+    try:
+        await client.edit_permissions(event.chat_id, reply.sender_id, until_date=until_date, send_messages=False)
+        suffix = f" برای {minutes_arg} دقیقه" if minutes_arg else ""
+        await event.edit(f"🔇 کاربر بی‌صدا شد{suffix}")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["رفع‌سکوت", "unmute"], arg=False)))
+async def unmute_handler(event):
+    if not event.is_reply:
+        return await event.edit("روی پیام کاربر ریپلای کن")
+    reply = await event.get_reply_message()
+    try:
+        await client.edit_permissions(event.chat_id, reply.sender_id, send_messages=True)
+        await event.edit("🔊 صدای کاربر برگشت")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["ادمین‌ها", "adminlist"], arg=False)))
+async def adminlist_handler(event):
+    try:
+        admins = await client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins)
+        if not admins:
+            return await event.edit("هیچ ادمینی پیدا نشد")
+        lines = ["👮 **ادمین‌های گروه:**\n"]
+        for a in admins:
+            name = f"{a.first_name or ''} {a.last_name or ''}".strip() or (a.username or str(a.id))
+            lines.append(f"• {name}" + (f" (@{a.username})" if a.username else ""))
+        await event.edit("\n".join(lines))
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["لینک‌گروه", "grouplink"], arg=False)))
+async def grouplink_handler(event):
+    try:
+        result = await client(functions.messages.ExportChatInviteRequest(peer=event.chat_id))
+        await event.edit(f"🔗 لینک دعوت گروه:\n{result.link}")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["قفل‌گروه", "lockgroup"], arg=False)))
+async def lockgroup_handler(event):
+    try:
+        rights = ChatBannedRights(until_date=None, send_messages=True)
+        await client(functions.messages.EditChatDefaultBannedRightsRequest(peer=event.chat_id, banned_rights=rights))
+        await event.edit("🔒 گروه قفل شد - فقط ادمین‌ها می‌تونن پیام بفرستن")
+    except Exception as e:
+        _record_error()
+        await event.edit(f"❌ خطا: {e}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=pat(["بازکردن‌گروه", "unlockgroup"], arg=False)))
+async def unlockgroup_handler(event):
+    try:
+        rights = ChatBannedRights(until_date=None, send_messages=False)
+        await client(functions.messages.EditChatDefaultBannedRightsRequest(peer=event.chat_id, banned_rights=rights))
+        await event.edit("🔓 گروه باز شد - همه می‌تونن پیام بفرستن")
     except Exception as e:
         _record_error()
         await event.edit(f"❌ خطا: {e}")
@@ -2023,12 +2304,17 @@ def build_help_text():
 {PREFIX}اطلاعات — اطلاعات کاربر (ریپلای اختیاری)
 
 **ابزار**
-{PREFIX}حساب <عبارت> — ماشین‌حساب
+{PREFIX}حساب <عبارت> — ماشین‌حساب (پشتیبانی از sqrt, sin, log, pi, ... )
 {PREFIX}کیوآر <متن> — ساخت کیو‌آر کد
 {PREFIX}کوتاه <لینک> — کوتاه‌کردن لینک
 {PREFIX}هوا <شهر> — آب‌وهوا
 {PREFIX}ترجمه <زبان> <متن> — ترجمه
 {PREFIX}جستجو <عبارت> — جستجوی گوگل
+{PREFIX}رمزعبور <طول اختیاری> — ساخت رمز عبور تصادفی
+{PREFIX}هش <الگوریتم اختیاری> <متن> — هش md5/sha1/sha256/sha512 (یا ریپلای)
+{PREFIX}بیس64 انکد/دیکد <متن> — تبدیل بیس۶۴ (یا ریپلای)
+{PREFIX}نویسه‌شمار <متن> — شمارش حروف/کلمات/خط (یا ریپلای)
+{PREFIX}ارز <عدد> <از> <به> — تبدیل نرخ ارز (مثلاً `{PREFIX}ارز 10 USD IRR`)
 
 **یادداشت**
 {PREFIX}یادداشت <کلید> <متن> — ذخیره یادداشت
@@ -2071,8 +2357,8 @@ def build_help_text():
 {PREFIX}نام <متن> — تغییر نام پایه (زیربنای ساعت زنده)
 {PREFIX}عکس — تغییر عکس پروفایل (ریپلای روی عکس)
 {PREFIX}ساعت روشن/خاموش — روشن/خاموش‌کردن ساعت زنده در نام
-{PREFIX}شکل‌ساعت — لیست استایل‌های ساعت (فونت/شکل)
-{PREFIX}شکل‌ساعت <نام>/بعدی — تغییر استایل ساعت
+{PREFIX}مدل‌ساعت — لیست مدل‌های ساعت (فونت/شکل)
+{PREFIX}مدل‌ساعت <نام>/بعدی — تغییر مدل ساعت (۱۵ مدل موجوده)
 
 **🤖 منشی چت**
 {PREFIX}منشی روشن/خاموش — روشن/خاموش کردن دستی (قفل می‌شه، تشخیص خودکار غیرفعال می‌شه)
@@ -2086,7 +2372,11 @@ def build_help_text():
 {PREFIX}منشی پاک — حذف لیست چت‌ها
 
 **مدیریت گروه** (فقط جایی که ادمین هستید)
-{PREFIX}اخراج / {PREFIX}مسدود / {PREFIX}ارتقا / {PREFIX}تنزل — با ریپلای روی کاربر
+{PREFIX}اخراج / {PREFIX}مسدود / {PREFIX}رفع‌مسدود / {PREFIX}ارتقا / {PREFIX}تنزل — با ریپلای روی کاربر
+{PREFIX}بی‌صدا <دقیقه اختیاری> / {PREFIX}رفع‌سکوت — با ریپلای روی کاربر
+{PREFIX}ادمین‌ها — لیست ادمین‌های گروه
+{PREFIX}لینک‌گروه — گرفتن لینک دعوت گروه
+{PREFIX}قفل‌گروه / {PREFIX}بازکردن‌گروه — قفل‌کردن ارسال پیام برای اعضای عادی
 
 **بکاپ‌گیری**
 {PREFIX}پشتیبان <عدد> — بکاپ متنی از پیام‌های چت به Saved Messages
